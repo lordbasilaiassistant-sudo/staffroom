@@ -8,6 +8,18 @@ your own model — including free ones. Self-hosts on Cloudflare in about five m
 > `http://localhost:8787/app?demo=1`. The demo is a seeded staffroom — real UI, fake data, no
 > account and no keys.
 
+![The office — pick a staffer, chat on the left, watch their computer on the right](docs/screenshots/office.png)
+
+<table><tr>
+<td width="55%"><img src="docs/screenshots/verified-work.png" alt="A staffer's completion claim carrying the green verified stamp, with their live activity feed beside it"></td>
+<td><img src="docs/screenshots/sign-in.png" alt="The sign-in card with the free one-day trial button"></td>
+</tr><tr>
+<td><em>"Done" gets checked: the ✓ stamp means the named files really changed after the work order.</em></td>
+<td><em>Accounts are email+password; trials are one day, no card.</em></td>
+</tr></table>
+
+*(Screenshots are from a hosted instance; your deploy looks the same with your own staff.)*
+
 ---
 
 ## The problem it solves
