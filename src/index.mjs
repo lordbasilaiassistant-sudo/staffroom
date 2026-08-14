@@ -18,8 +18,14 @@
  *   cron hourly      — appends a line to system/heartbeat.log (the machine-is-up proof).
  *
  * AUTH: Authorization: Bearer <token>, where the token is either COMPUTER_TOKEN (the machine key
- * your agents carry) or a session token from POST /auth/login (humans). Public: GET / and the
- * UI shell — every data call the page makes is bearer-gated.
+ * your agents carry) or a session token from POST /auth/login (humans). Public: GET /, the UI
+ * shell, and POST /auth/signup + /auth/login — every data call the page makes is bearer-gated.
+ *
+ * TENANCY: the machine key and the owner (`founder-unlimited` plan) are ROOT — they see the real
+ * office at the top of the bucket. Every other account is isolated inside its own
+ * tenants/<id>/ namespace: own threads, own staff activity, own shared/ workspace. Tenants get
+ * the chat product only; the ops surfaces (fs, mcp, runner, feeds) stay root-only.
+ *
  * NAMESPACING: paths are free-form; convention is <name>/... for a staffer's private work and
  * shared/... for handoffs. system/ is the worker's own — writes there are refused.
  *
@@ -34,6 +40,9 @@ import { runTick } from './runner.mjs';
 const JSONH = { 'content-type': 'application/json; charset=utf-8' };
 const err = (status, message) => new Response(JSON.stringify({ ok: false, error: message }), { status, headers: JSONH });
 const MAX_BYTES = 25 * 1024 * 1024;
+
+// The owner's display name — the boss in every thread. Set OWNER_NAME in wrangler.toml.
+const owner = (env) => env.OWNER_NAME || 'Owner';
 
 /* ACTIVITY FEED — every staffer can broadcast what it is doing, and the UI renders that
  * stream as "their screen":
@@ -52,14 +61,16 @@ const RUNNER_CRON = '*/3 * * * *';
 /* The default team. Replace these with your own — the bio doubles as the staffer's job
  * description, so it is worth writing as if the agent will read it (it can). */
 const DEFAULT_STAFF = [
-  { screen_name: 'Ada', emoji: '📊', bio: 'ops lead — plans the work, splits it up, reports back' },
+  { screen_name: 'Ada', emoji: '📊', bio: 'ops lead — runs the office, ships products, reports to you' },
   { screen_name: 'Patch', emoji: '🔧', bio: 'fixes what breaks — bugs, deploys, drift, red checks' },
   { screen_name: 'Quill', emoji: '✍️', bio: 'writes — docs, release notes, replies that go out' },
   { screen_name: 'Scout', emoji: '🔭', bio: 'research — sources, comparisons, competitor reads' },
   { screen_name: 'Probe', emoji: '🧪', bio: 'the skeptic — verifies claims, runs the gates, breaks things on purpose' },
 ];
 
-async function postActivity(env, body) {
+/* tp = tenant prefix: '' for root, 'tenants/<id>/' for everyone else. Every R2 key this function
+ * touches is prefixed so a tenant staffer's screen and feed live inside the tenant's world. */
+async function postActivity(env, body, tp = '') {
   const emp = String(body?.employee || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
   if (!emp) throw { code: -32602, msg: 'employee is required (letters/digits/dash)' };
   const action = String(body?.action || '').slice(0, 200);
@@ -69,12 +80,12 @@ async function postActivity(env, body) {
     try {
       const bytes = Uint8Array.from(atob(body.screenshot_b64.replace(/^data:[^,]*,/, '')), (c) => c.charCodeAt(0));
       if (bytes.length <= 4 * 1024 * 1024) {
-        await env.FS.put(`screens/${emp}/latest.png`, bytes, { contentType: 'image/png' });
+        await env.FS.put(`${tp}screens/${emp}/latest.png`, bytes, { contentType: 'image/png' });
         ev.screen = true;
       } else ev.detail += ' [screenshot dropped: over 4MB]';
     } catch { ev.detail += ' [screenshot dropped: bad base64]'; }
   }
-  const key = `system-feed/${emp}.jsonl`;
+  const key = `${tp}system-feed/${emp}.jsonl`;
   const prev = await env.FS.get(key);
   let lines = prev ? (await prev.text()).split('\n').filter(Boolean) : [];
   lines.push(JSON.stringify(ev));
@@ -88,7 +99,7 @@ const MANUAL = {
   what: 'An always-on computer for AI staff: an R2 filesystem every agent harness can mount over MCP or REST, plus activity feeds, screens and private team chat.',
   mcp: 'POST /mcp (Streamable HTTP, JSON-RPC 2.0) — tools: fs_read, fs_write, fs_append, fs_list, fs_delete',
   rest: 'GET|PUT|DELETE /fs/<path> · GET /ls/<prefix>',
-  auth: 'Authorization: Bearer <token> — the machine key for agents, or a session token from POST /auth/login',
+  auth: 'Authorization: Bearer <token> — the machine key for agents, or a session token from POST /auth/login (POST /auth/signup for a trial account)',
   conventions: '<name>/... private · shared/... handoffs · system/... machine-owned (read-only to you)',
   heartbeat: 'GET /fs/system/heartbeat.log — one line per hour, written whether or not any PC is awake',
   ui: 'GET /app (sign in) · GET /app?demo=1 (seeded demo, no account needed)',
@@ -153,20 +164,21 @@ async function runTool(env, name, args) {
  *
  * Language models — especially cheap ones — report "done" when the artifact never landed, and a
  * chat transcript full of confident completions is worth nothing on its own. So the platform
- * checks, inside the chat: when an AGENT's message sounds like completion, find the last work
- * order in the thread that named shared/ paths and verify each of those paths actually changed
- * AFTER that order was posted. The verdict rides along with the message rather than blocking the
- * send, because a rejected agent just retries the same claim in a loop, whereas a visible
- * "unverified" is information for whoever is reading.
+ * checks, inside the chat: when a message that is NOT from the owner sounds like completion, find
+ * the last work order in the thread that named shared/ paths and verify each of those paths
+ * actually changed AFTER that order was posted. The verdict rides along with the message rather
+ * than blocking the send, because a rejected agent just retries the same claim in a loop, whereas
+ * a visible "unverified" is information for whoever is reading.
  *
- * `isAgent` comes from the caller's credential, never from a name in the payload — see authInfo.
- * Returns the verify object, or null when there was nothing to check. */
-async function appendToThread(env, who, from, body, isAgent) {
-  const key = `threads/${who}.jsonl`;
+ * The sender name is server-decided at the route layer (see /chat/send), so nobody can post as
+ * the owner to skip the check. Returns the verify object, or null when there was nothing to check. */
+async function appendToThread(env, who, from, body, tp = '') {
+  const key = `${tp}threads/${who}.jsonl`;
   const prev = await env.FS.get(key);
   let lines = prev ? (await prev.text()).split('\n').filter(Boolean) : [];
   const msg = { from, body: String(body).slice(0, 8000), created_at: new Date().toISOString() };
-  const claimsDone = isAgent && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back)\b/i.test(msg.body);
+  const claimsDone = from !== owner(env)
+    && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back)\b/i.test(msg.body);
   if (claimsDone) {
     const order = [...lines].reverse().map((l) => JSON.parse(l)).find((m) => m.from !== from && /shared\/[\w\/.-]+/.test(m.body));
     if (order) {
@@ -174,8 +186,8 @@ async function appendToThread(env, who, from, body, isAgent) {
       const checked = [];
       for (const p of paths.slice(0, 10)) {
         const isDir = !/\.[a-z0-9]+$/i.test(p);
-        const list = await env.FS.list({ prefix: p.replace(/\/$/, '') + (isDir ? '/' : ''), limit: 20 });
-        const objs = isDir ? list.objects : (list.objects.length ? list.objects : (await env.FS.list({ prefix: p, limit: 5 })).objects);
+        const list = await env.FS.list({ prefix: tp + p.replace(/\/$/, '') + (isDir ? '/' : ''), limit: 20 });
+        const objs = isDir ? list.objects : (list.objects.length ? list.objects : (await env.FS.list({ prefix: tp + p, limit: 5 })).objects);
         const changed = objs.some((o) => new Date(o.uploaded) > new Date(order.created_at));
         checked.push({ path: p, changed });
       }
@@ -204,7 +216,7 @@ async function handleMcp(req, env) {
       out.push(rpcResult(id, {
         protocolVersion: params?.protocolVersion || '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: 'staffroom', version: '0.1.0' },
+        serverInfo: { name: 'staffroom', version: '0.2.0' },
       }));
     } else if (method === 'notifications/initialized') {
       // notification — no response
@@ -229,9 +241,10 @@ async function handleMcp(req, env) {
 }
 
 /* ── ACCOUNTS: email+password login for humans; COMPUTER_TOKEN stays the machine key.
- * users at system/users.json {email:{salt,hash,plan,name}}; sessions at system/sessions.json
- * {token:{email,exp}}. Passwords: salted SHA-256, plaintext never stored. `plan` is carried on
- * the record but nothing enforces it yet — it is a label, not a limit. */
+ * users at system/users.json {email:{salt,hash,plan,name,created}}; sessions at
+ * system/sessions.json {token:{email,exp}}. Passwords: salted SHA-256, plaintext never stored.
+ * Plans: founder-unlimited (root — the owner), trial-1day (24h + a message cap), anything else
+ * (a paid tenant; no cap enforced here). */
 async function sha256hex(s) {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -240,24 +253,55 @@ async function readJson(env, key, fallback) {
   const o = await env.FS.get(key);
   return o ? JSON.parse(await o.text()) : fallback;
 }
-/* Returns null, {kind:'machine'} or {kind:'session', email, name}. The KIND is what separates a
- * human in the browser from an agent posting with the machine key — chat uses it to decide whose
- * claims get verified, so it must come from the credential, never from a name in the payload. */
-async function authInfo(env, auth) {
+/* TENANT ISOLATION. Without it, a fresh trial signup could read the owner's threads AND the whole
+ * bucket via /fs. So: the machine key and the founder-unlimited plan resolve to ROOT; every other
+ * account maps to tenants/<sha16('tenant:'+email)>/ — a private world with its own staff. The
+ * tenant's display name falls back to the email prefix, and gets '.you' appended if it collides
+ * with a staffer's name (so claim verification can still tell the boss from the staff). */
+async function sessionFor(env, auth) {
   if (!auth?.startsWith('Bearer ')) return null;
   const t = auth.slice(7);
-  if (env.COMPUTER_TOKEN && t === env.COMPUTER_TOKEN) return { kind: 'machine' };
+  if (env.COMPUTER_TOKEN && t === env.COMPUTER_TOKEN) return { root: true, name: owner(env), machine: true };
   const sessions = await readJson(env, 'system/sessions.json', {});
   const s = sessions[t];
   if (!s || !(s.exp > Date.now())) return null;
   const users = await readJson(env, 'system/users.json', {});
-  return { kind: 'session', email: s.email, name: users[s.email]?.name || s.email.split('@')[0] };
+  const rec = users[s.email];
+  if (!rec) return null;
+  // trial enforcement holds mid-session too, not just at login
+  if (rec.plan === 'trial-1day' && Date.now() - Date.parse(rec.created) > 24 * 3600 * 1000) return null;
+  if (rec.plan === 'founder-unlimited') return { root: true, name: owner(env), email: s.email, plan: rec.plan };
+  const tid = (await sha256hex('tenant:' + s.email)).slice(0, 16);
+  let name = rec.name || s.email.split('@')[0];
+  if (DEFAULT_STAFF.some((x) => x.screen_name.toLowerCase() === name.toLowerCase())) name += '.you'; // never collide with a staffer name
+  return { root: false, tp: `tenants/${tid}/`, tid, name, email: s.email, plan: rec.plan };
+}
+
+/* Deps for the runner, scoped to a tenant prefix ('' = the root office).
+ * Tenant staffers read/write ONLY inside tenants/<id>/ — paths are prefixed before they touch R2,
+ * and fs_list output has the prefix stripped so the model's world stays consistent. */
+function scopedDeps(tp) {
+  const rt = async (env2, name, args) => {
+    if (!tp) return runTool(env2, name, args);
+    const a = { ...(args || {}) };
+    if (a.path != null) a.path = tp + cleanPath(a.path);
+    if (name === 'fs_list') a.prefix = tp + cleanPath(a.prefix || '');
+    const out = await runTool(env2, name, a);
+    return name === 'fs_list' ? String(out).split(tp).join('') : out;
+  };
+  return {
+    runTool: rt,
+    postActivity: (env2, body) => postActivity(env2, body, tp),
+    appendToThread: (env2, who, from, body) => appendToThread(env2, who, from, body, tp),
+    staff: DEFAULT_STAFF,
+    tp,
+  };
 }
 
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     const u = new URL(req.url);
-    const ownerName = env.OWNER_NAME || 'Owner';
+    const ownerName = owner(env);
     if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '')) {
       return new Response(JSON.stringify(MANUAL, null, 2), { headers: JSONH });
     }
@@ -272,7 +316,19 @@ export default {
     if (req.method === 'GET' && u.pathname === '/app.js') {
       return new Response(APP_JS, { headers: { 'content-type': 'text/javascript; charset=utf-8' } });
     }
-    // login is the one data route reachable without auth
+    // self-serve signup: the 1-day free trial (no card, account only). One account per email.
+    if (u.pathname === '/auth/signup' && req.method === 'POST') {
+      const b = await req.json().catch(() => ({}));
+      const email = String(b.email || '').toLowerCase().trim();
+      if (!email.includes('@') || String(b.password || '').length < 6) return err(400, 'need a real email and a password of 6+ characters');
+      const users = await readJson(env, 'system/users.json', {});
+      if (users[email]) return err(409, 'account exists - sign in instead');
+      const salt = [...crypto.getRandomValues(new Uint8Array(16))].map((x) => x.toString(16).padStart(2, '0')).join('');
+      users[email] = { salt, hash: await sha256hex(salt + String(b.password)), plan: 'trial-1day', name: b.name || email.split('@')[0], created: new Date().toISOString() };
+      await env.FS.put('system/users.json', JSON.stringify(users));
+      return new Response(JSON.stringify({ ok: true, email, plan: 'trial-1day', note: 'trial runs 24h from now' }), { headers: JSONH });
+    }
+    // login is the other data route reachable without auth
     if (u.pathname === '/auth/login' && req.method === 'POST') {
       const b = await req.json().catch(() => ({}));
       const email = String(b.email || '').toLowerCase().trim();
@@ -281,29 +337,39 @@ export default {
       if (!rec || (await sha256hex(rec.salt + String(b.password || ''))) !== rec.hash) {
         return err(401, 'wrong email or password');
       }
+      if (rec.plan === 'trial-1day' && Date.now() - Date.parse(rec.created) > 24 * 3600 * 1000) {
+        return err(402, 'your 1-day trial has ended - upgrade to keep your staff working');
+      }
       const token = [...crypto.getRandomValues(new Uint8Array(24))].map((x) => x.toString(16).padStart(2, '0')).join('');
       const sessions = await readJson(env, 'system/sessions.json', {});
       for (const [k, v] of Object.entries(sessions)) if (v.exp < Date.now()) delete sessions[k];
       sessions[token] = { email, exp: Date.now() + 30 * 24 * 3600 * 1000 };
       await env.FS.put('system/sessions.json', JSON.stringify(sessions));
-      return new Response(JSON.stringify({ ok: true, token, name: rec.name, plan: rec.plan }), { headers: JSONH });
+      const out = { ok: true, token, name: rec.plan === 'founder-unlimited' ? ownerName : rec.name, plan: rec.plan };
+      if (rec.plan === 'trial-1day') out.trial_ends = new Date(Date.parse(rec.created) + 24 * 3600 * 1000).toISOString();
+      return new Response(JSON.stringify(out), { headers: JSONH });
     }
 
     const auth = req.headers.get('authorization') || '';
-    const me = await authInfo(env, auth);
-    if (!me) {
+    const sess = await sessionFor(env, auth);
+    if (!sess) {
       return new Response(JSON.stringify({ ok: false, error: 'sign in required' }), { status: 401, headers: JSONH });
+    }
+    const tp = sess.root ? '' : sess.tp;
+    // tenants get the chat product; the ops surfaces (fs/mcp/runner/feeds) stay root-only
+    if (!sess.root && !(u.pathname.startsWith('/chat/') || (u.pathname.startsWith('/activity/') && req.method === 'GET') || u.pathname.startsWith('/screen/'))) {
+      return err(403, 'not available on your plan');
     }
 
     // admin-only (machine key): create/replace a user with a hashed password
     if (u.pathname === '/auth/register' && req.method === 'POST') {
-      if (me.kind !== 'machine') return err(403, 'machine key required');
+      if (!sess.machine) return err(403, 'machine key required');
       const b = await req.json().catch(() => ({}));
       const email = String(b.email || '').toLowerCase().trim();
       if (!email.includes('@') || !b.password) return err(400, 'need {email, password, plan?, name?}');
       const users = await readJson(env, 'system/users.json', {});
       const salt = [...crypto.getRandomValues(new Uint8Array(16))].map((x) => x.toString(16).padStart(2, '0')).join('');
-      users[email] = { salt, hash: await sha256hex(salt + String(b.password)), plan: b.plan || 'trial', name: b.name || email.split('@')[0], created: new Date().toISOString() };
+      users[email] = { salt, hash: await sha256hex(salt + String(b.password)), plan: b.plan || 'trial-1day', name: b.name || email.split('@')[0], created: b.created || new Date().toISOString() };
       await env.FS.put('system/users.json', JSON.stringify(users));
       return new Response(JSON.stringify({ ok: true, email, plan: users[email].plan }), { headers: JSONH });
     }
@@ -312,8 +378,8 @@ export default {
     // Manual runner trigger (machine key only) — for testing, and for draining threads on demand
     // rather than waiting for the next cron tick.
     if (u.pathname === '/runner/tick' && req.method === 'POST') {
-      if (me.kind !== 'machine') return err(403, 'machine key required');
-      const results = await runTick(env, { runTool, postActivity, appendToThread, staff: DEFAULT_STAFF });
+      if (!sess.machine) return err(403, 'machine key required');
+      const results = await runTick(env, scopedDeps(''));
       return new Response(JSON.stringify({ ok: true, results }), { headers: JSONH });
     }
 
@@ -327,14 +393,19 @@ export default {
     if (u.pathname.startsWith('/activity/') && req.method === 'GET') {
       const emp = u.pathname.split('/')[2]?.replace(/[^a-zA-Z0-9_-]/g, '') || '';
       const limit = Math.min(Number(u.searchParams.get('limit')) || 50, FEED_CAP);
-      const obj = await env.FS.get(`system-feed/${emp}.jsonl`);
+      const obj = await env.FS.get(`${tp}system-feed/${emp}.jsonl`);
       const lines = obj ? (await obj.text()).split('\n').filter(Boolean) : [];
       return new Response(JSON.stringify({ ok: true, employee: emp, events: lines.slice(-limit).reverse().map((l) => JSON.parse(l)) }), { headers: JSONH });
     }
 
     // ── CHAT: private team comms, one thread per staffer, stored in this worker's own R2
-    // at threads/<name>.jsonl. A responder drains its thread and appends replies the same way.
+    // at threads/<name>.jsonl (tenant-prefixed). A responder drains its thread and appends
+    // replies the same way.
     if (u.pathname === '/chat/roster' && req.method === 'GET') {
+      if (!sess.root) {
+        // a tenant's staff are always "at their desks" — they wake the moment you message them
+        return new Response(JSON.stringify({ ok: true, agents: DEFAULT_STAFF.map((s) => ({ ...s, online: true })), owner: ownerName }), { headers: JSONH });
+      }
       const feeds = await env.FS.list({ prefix: 'system-feed/', limit: 200 });
       const active = Object.fromEntries(feeds.objects.map((o) => [o.key.slice('system-feed/'.length).replace(/\.jsonl$/, ''), o.uploaded]));
       const agents = DEFAULT_STAFF.map((s) => ({ ...s, online: active[s.screen_name.toLowerCase()] ? (Date.now() - new Date(active[s.screen_name.toLowerCase()]) < 600000) : false }));
@@ -345,19 +416,37 @@ export default {
     }
     if (u.pathname.startsWith('/chat/thread/') && req.method === 'GET') {
       const who = (u.pathname.split('/')[3] || '').replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
-      const obj = await env.FS.get(`threads/${who}.jsonl`);
+      const obj = await env.FS.get(`${tp}threads/${who}.jsonl`);
       const messages = obj ? (await obj.text()).split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
-      return new Response(JSON.stringify({ ok: true, messages: messages.slice(-200) }), { headers: JSONH });
+      let working = false;
+      const st = await env.FS.get(`${tp}system-status/${who}`);
+      if (st) working = Date.now() - Number(await st.text()) < 150000;
+      return new Response(JSON.stringify({ ok: true, messages: messages.slice(-200), working }), { headers: JSONH });
     }
     if (u.pathname === '/chat/send' && req.method === 'POST') {
       const b = await req.json().catch(() => ({}));
       const who = String(b.to || '').replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
+      // the server decides the sender: machine/owner may pass from; a tenant is always themselves
+      const from = sess.root ? String(b.from || ownerName).slice(0, 40) : sess.name.slice(0, 40);
       if (!who || !b.body) return err(400, 'need {to, body} (agents also pass their own "from")');
-      // A human's name comes from their session; an agent names itself. Never from the payload
-      // for humans, or anyone could post as the boss.
-      const isHuman = me.kind === 'session';
-      const from = isHuman ? me.name : String(b.from || 'agent').slice(0, 40);
-      const verify = await appendToThread(env, who, from, b.body, !isHuman);
+      // trial cost cap (model calls are metered kindness, not infinite)
+      if (!sess.root && sess.plan === 'trial-1day') {
+        // ROOT-namespace usage file, on purpose: a tenant's staffers write only under tenants/<id>/,
+        // so nothing inside the tenant's world can reset its own meter.
+        const uKey = `system/tenant-usage/${sess.tid}.json`;
+        const usage = await readJson(env, uKey, { sends: 0 });
+        if (usage.sends >= 40) return err(429, 'trial message limit reached (40) - upgrade to keep your staff working');
+        usage.sends++;
+        await env.FS.put(uKey, JSON.stringify(usage));
+      }
+      const verify = await appendToThread(env, who, from, b.body, tp);
+      // WAKE-ON-SEND: a human message to a staffer triggers an immediate runner pass in the
+      // background — replies in seconds instead of "sometime this cron". The */3 cron stays as
+      // the sweeper for the root office; tenant threads answer on wake only.
+      if (sess.root ? from === ownerName : true) {
+        const staffer = DEFAULT_STAFF.find((s) => s.screen_name.toLowerCase() === who);
+        if (staffer) ctx.waitUntil(import('./runner.mjs').then((m) => m.respondForStaffer(env, scopedDeps(tp), staffer)).catch(() => {}));
+      }
       return new Response(JSON.stringify({ ok: true, from, verify }), { headers: JSONH });
     }
 
@@ -368,7 +457,7 @@ export default {
     }
     if (u.pathname.startsWith('/screen/') && req.method === 'GET') {
       const emp = u.pathname.split('/')[2]?.replace(/[^a-zA-Z0-9_-]/g, '') || '';
-      const obj = await env.FS.get(`screens/${emp}/latest.png`);
+      const obj = await env.FS.get(`${tp}screens/${emp}/latest.png`);
       if (!obj) return err(404, `no screen for "${emp}" yet`);
       return new Response(obj.body, { headers: { 'content-type': 'image/png', 'cache-control': 'no-store' } });
     }
@@ -408,10 +497,10 @@ export default {
   },
 
   async scheduled(event, env) {
-    // Frequent cron: the staff answer their threads. Wrapped in try/catch because a brain outage
-    // must not take the heartbeat down with it.
+    // Frequent cron: the staff answer their threads (root office only — tenant threads answer on
+    // wake-on-send). Wrapped in try/catch because a brain outage must not take the heartbeat down.
     if (event.cron === RUNNER_CRON) {
-      try { await runTick(env, { runTool, postActivity, appendToThread, staff: DEFAULT_STAFF }); } catch {}
+      try { await runTick(env, scopedDeps('')); } catch {}
       return;
     }
     // Hourly cron: the proof that the computer outlives your laptop — one line per hour, from the edge.

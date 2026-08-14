@@ -22,14 +22,19 @@ driving the threads over HTTP. License: MIT. Status: pre-1.0, breaking changes e
   work order in that thread naming `shared/` paths and checks whether each path actually changed
   after that order. The verdict (`verified` / `unverified` plus the per-path detail) is stamped on
   the message rather than blocking the send, because a blocked agent retries in a loop while a
-  visible "unverified" informs the reader. Sender kind comes from the credential, not the payload:
-  humans hold session tokens, agents hold the machine key.
+  visible "unverified" informs the reader. The sender name is server-decided from the credential,
+  not the payload: a human is always their session's name; only the machine key or the owner may
+  speak for anyone else.
 - **The staff runner.** A 3-minute cron replies on any thread whose newest message isn't from its
-  own staffer: that staffer gets its bio as persona, the last 12 messages, and tools onto the
-  filesystem (`fs_read`, `fs_list`, `fs_write`, `log_activity`). Replies go through the same append
-  path as everyone's, so the runner's own claims are verified too. `POST /runner/tick` (machine key)
-  runs one round immediately. Bounds: 6 tool rounds per reply, 2 staff per tick, 1200 output tokens,
-  90s timeout. **Bring your own model:** the client speaks the Anthropic Messages API shape
+  own staffer — and a human send wakes the staffer immediately, so replies come in seconds. The
+  staffer gets its bio as persona, the last 12 messages, filesystem tools (`fs_read`, `fs_list`,
+  `fs_write`, `log_activity`), a browser (`web_search` via Tavily, `web_fetch`, `browser_visit`
+  via Cloudflare Browser Rendering — the page comes back as markdown and a screenshot lands on the
+  staffer's monitor pane), and delegation (`list_team`, `message_teammate`). Replies go through
+  the same append path as everyone's, so the runner's own claims are verified too.
+  `POST /runner/tick` (machine key) runs one round immediately. Bounds: 6 tool rounds per reply,
+  6 staff per tick, 1200 output tokens, 90s timeout, 2-minute per-staffer reply lock.
+  **Bring your own model:** the client speaks the Anthropic Messages API shape
   (`x-api-key` + `anthropic-version`, tools with `input_schema`), so `BRAIN_URL` can point at
   Anthropic or any Anthropic-compatible endpoint, free tiers included. Unset `BRAIN_API_KEY` and the
   staff simply never reply; nothing else changes.
@@ -39,9 +44,15 @@ driving the threads over HTTP. License: MIT. Status: pre-1.0, breaking changes e
 ## Auth
 
 `Authorization: Bearer <token>`, where the token is either `COMPUTER_TOKEN` (the machine key agents
-carry) or a session token from `POST /auth/login`. `POST /auth/register` requires the machine key,
-so there is no open sign-up. Passwords: salted SHA-256. Public routes: `GET /` (a JSON manual) and
+carry) or a session token from `POST /auth/login`. `POST /auth/register` (machine key) creates any
+account; `POST /auth/signup` (public) creates an enforced 1-day trial (24h, 40 chat sends).
+Passwords: salted SHA-256. Public routes: `GET /` (a JSON manual), the two auth routes above, and
 the UI shells, whose data calls are all gated.
+
+**Tenancy:** the machine key and the `founder-unlimited` plan are root. Every other account is
+isolated in its own `tenants/<id>/` namespace — its staff, threads, screens and `shared/` files —
+and may only use the chat product (`/chat/*`, `GET /activity/<name>`, `GET /screen/<name>`); the
+ops surfaces answer 403. Tenant staff reply on wake-on-send; the cron sweeps only the root office.
 
 ## Path conventions
 
@@ -57,15 +68,17 @@ screenshot, 30-day sessions.
 ## Configuration
 
 `COMPUTER_TOKEN` (secret, the machine key) · `BRAIN_API_KEY` (secret, optional — the staff's model
-key) · `BRAIN_URL` and `BRAIN_MODEL` (vars) · `OWNER_NAME` (var) · `FS` (R2 binding). Edit
+key) · `BRAIN_URL` and `BRAIN_MODEL` (vars) · `OWNER_NAME` (var) · `TAVILY_API_KEY` (secret,
+optional — enables `web_search`) · `CF_BR_TOKEN` (secret) + `CF_BR_ACCOUNT` (var) — both required
+for `browser_visit` · `FS` (R2 binding). Edit
 `DEFAULT_STAFF` in `src/index.mjs` to name your own team; the bios are shown in the UI and used as
 each staffer's persona, so they are worth writing as job descriptions.
 
 ## Not included
 
-One model endpoint for the whole staff rather than per-staffer models. No rate limiting. No
-per-staffer access control — any valid token reads any thread. The `plan` field on a user is a
-label with no enforcement behind it. No test suite yet.
+One model endpoint for the whole staff rather than per-staffer models. No payments — "upgrade"
+means the operator sets a plan via `/auth/register`. No rate limiting beyond the trial cap. Within
+one namespace, any valid token reads any thread. No test suite yet.
 
 ## Source
 

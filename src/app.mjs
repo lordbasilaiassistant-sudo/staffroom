@@ -18,17 +18,16 @@ export const APP_HTML = `<!doctype html>
 html,body{height:100%}
 body{background:var(--bg);color:var(--txt);font:14.5px/1.55 ui-sans-serif,system-ui,'Segoe UI',sans-serif;overflow:hidden}
 #shell{display:grid;grid-template-columns:290px 1fr 380px;height:100vh;transition:grid-template-columns .2s ease}
-#shell.norail{grid-template-columns:0 1fr 380px}
-#shell.nopc{grid-template-columns:290px 1fr 0}
-#shell.norail.nopc{grid-template-columns:0 1fr 0}
-#shell.norail #rail,#shell.nopc #pc{display:none}
+#shell.norail #rail{display:none}
+#shell.nopc #pc{display:none}
+/* pin panes to their columns — display:none must never reshuffle grid auto-placement */
+#rail{grid-column:1}#chat{grid-column:2}#pc{grid-column:3}
 .paneltoggle{width:34px;height:34px;border-radius:9px;border:1px solid var(--line);background:var(--panel);
 color:var(--dim);cursor:pointer;display:grid;place-items:center;font-size:15px;box-shadow:var(--raise);flex:none}
 .paneltoggle:hover{color:var(--txt);border-color:var(--linehi)}
-@media (max-width:1150px){#shell{grid-template-columns:290px 1fr 0}#shell #pc{display:none}
-#shell.showpc{grid-template-columns:0 1fr 380px}#shell.showpc #rail{display:none}#shell.showpc #pc{display:block}}
-@media (max-width:760px){#shell{grid-template-columns:0 1fr 0}#shell #rail{display:none}
-#shell.showrail{grid-template-columns:100vw 0 0}#shell.showrail #rail{display:flex}}
+#fab{position:fixed;top:10px;left:10px;z-index:6;display:none}
+#pchead{display:flex;align-items:center;gap:8px;margin:2px 4px 10px;color:var(--dim);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase}
+#pchead button{margin-left:auto}
 #rail{background:var(--rail);border-right:1px solid var(--line);display:flex;flex-direction:column}
 #rail .brand{display:flex;align-items:center;gap:10px;padding:16px 18px;border-bottom:1px solid var(--line)}
 #rail .brand .logo{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--acc),var(--acc2));box-shadow:0 0 18px rgba(94,234,212,.35)}
@@ -91,11 +90,12 @@ color:var(--dim);cursor:pointer;display:grid;place-items:center;font-size:15px;b
 ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
 </style></head><body>
 <div id="shell">
-<nav id="rail"><div class="brand"><div class="logo"></div><div><b>Staffroom</b><span>your AI staff, always on</span></div><span id="demobadge">DEMO</span></div><div id="emps"></div></nav>
+<nav id="rail"><div class="brand"><div class="logo"></div><div><b>Staffroom</b><span>your AI staff, always on</span></div><span id="demobadge">DEMO</span><button id="signout" title="sign out" style="margin-left:auto;background:none;border:0;color:var(--dim);cursor:pointer;font-size:15px">⏻</button></div><div id="emps"></div></nav>
 <section id="chat"><div id="empty">Pick a staffer.<br><br>They answer here, and their computer<br>opens on the right so you can watch them work.</div></section>
 <aside id="pc"></aside>
 </div>
-<div id="gate"><div class="card"><b>Sign in to the staffroom</b><div style="color:var(--dim);font-size:13px;margin-top:6px" id="gerr">Your team is already at their desks.</div><input id="em" type="email" placeholder="email" autocomplete="username"><input id="tk" type="password" placeholder="password" autocomplete="current-password"><button id="gbtn">Clock in</button><div class="demo"><a href="?demo=1">or walk through the demo staffroom &rarr;</a></div></div></div>
+<button class="paneltoggle" id="fab" title="show your staff">☰</button>
+<div id="gate"><div class="card"><b>Sign in to the staffroom</b><div style="color:var(--dim);font-size:13px;margin-top:6px" id="gerr">Your team is already at their desks.</div><input id="em" type="email" placeholder="email" autocomplete="username"><input id="tk" type="password" placeholder="password" autocomplete="current-password"><button id="gbtn">Clock in</button><button id="gsign" style="width:100%;margin-top:10px;padding:11px;border-radius:10px;border:1px solid var(--linehi);background:transparent;color:var(--txt);font-weight:650;cursor:pointer">Start free 1-day trial</button><div class="demo"><a href="?demo=1">or walk through the demo staffroom &rarr;</a></div></div></div>
 <script src="/app.js"></script>
 </body></html>`;
 
@@ -111,9 +111,27 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s??'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 let sel=null, roster=[], feedsAt={}, timer=null, lastKey='';
 
+/* PANELS: ONE state object drives the grid from JS; breakpoints clamp but can never trap — the
+ * fixed ☰ button always exists when the rail is hidden, and the PC pane carries its own ✕.
+ * (The previous CSS-class approach let display:none reshuffle grid auto-placement and stranded
+ * the user with every pane hidden at half-screen widths.) */
+let PS;try{PS=JSON.parse(localStorage.getItem('office_panels')||'{}')}catch(e){PS={}}
+if(typeof PS.rail!=='boolean')PS.rail=true;
+if(typeof PS.pc!=='boolean')PS.pc=true;
+function applyPanels(){
+ const w=innerWidth,s=$('shell');if(!s)return;
+ let rail=PS.rail,pc=PS.pc;
+ if(w<=760){pc=false;s.style.gridTemplateColumns=rail?'100vw 0 0':'0 1fr 0';}
+ else if(w<=1150){if(rail&&pc)pc=false;s.style.gridTemplateColumns=(rail?'250px':'0')+' 1fr '+(pc?'340px':'0');}
+ else{s.style.gridTemplateColumns=(rail?'290px':'0')+' 1fr '+(pc?'380px':'0');}
+ s.classList.toggle('norail',!rail);s.classList.toggle('nopc',!pc);
+ $('fab').style.display=rail?'none':'grid';}
+function savePanels(){localStorage.setItem('office_panels',JSON.stringify(PS));applyPanels();}
+window.addEventListener('resize',applyPanels);
+
 // ── demo world ────────────────────────────────────────────────────────────────
 const DEMO_STAFF=[
- {screen_name:'Ada',emoji:'📊',bio:'ops lead - plans the work, splits it up, reports back',online:true},
+ {screen_name:'Ada',emoji:'📊',bio:'ops lead - runs the office, ships products, reports to you',online:true},
  {screen_name:'Patch',emoji:'🔧',bio:'fixes what breaks - bugs, deploys, drift',online:true},
  {screen_name:'Quill',emoji:'✍️',bio:'writes - docs, release notes, replies that go out',online:true},
  {screen_name:'Scout',emoji:'🔭',bio:'research - sources, comparisons, competitor reads',online:false},
@@ -172,9 +190,10 @@ async function pick(n){
  const a=roster.find(x=>x.screen_name===n)||{};
  $('chat').innerHTML='<div id="chead"><button class="paneltoggle" id="tgrail" title="staff">☰</button>'+orb(n,a.emoji)+'<div style="flex:1;min-width:0"><div class="n">'+esc(n)+'</div><div class="b">'+esc(a.bio||'')+'</div></div><button class="paneltoggle" id="tgpc" title="their computer">🖥</button></div><div id="thread"></div><div id="composer"><textarea id="box" placeholder="Message '+esc(n)+'…"></textarea><button id="send">Send</button></div>';
  $('send').onclick=send;
- $('tgrail').onclick=()=>{const s=$('shell');if(innerWidth<=760){s.classList.toggle('showrail');}else s.classList.toggle('norail');};
- $('tgpc').onclick=()=>{const s=$('shell');if(innerWidth<=1150){s.classList.toggle('showpc');}else s.classList.toggle('nopc');};
+ $('tgrail').onclick=()=>{PS.rail=!PS.rail;savePanels();};
+ $('tgpc').onclick=()=>{PS.pc=!PS.pc;if(PS.pc&&innerWidth<=1150)PS.rail=false;savePanels();};
  $('box').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}};
+ if(innerWidth<=760){PS.rail=false;savePanels();} // phone: picking someone reveals the chat
  await refresh();if(!DEMO)timer=setInterval(refresh,5000);}
 
 function verifyBadge(m){
@@ -194,8 +213,9 @@ async function refresh(){
  if(!sel)return;
  if(DEMO){paintThread(DEMO_THREADS[sel.toLowerCase()]||[]);renderPC();return;}
  try{const d=await(await api('/chat/thread/'+encodeURIComponent(sel))).json();
-  const key=JSON.stringify((d.messages||[]).slice(-1));
-  if(key!==lastKey){lastKey=key;paintThread(d.messages||[]);}
+  const key=JSON.stringify((d.messages||[]).slice(-1))+(d.working?'+w':'');
+  if(key!==lastKey){lastKey=key;paintThread(d.messages||[]);
+   if(d.working){const t=document.createElement('div');t.className='typing';t.title=sel+' is working';t.innerHTML='<b></b><b></b><b></b>';$('thread').appendChild(t);$('thread').scrollTop=1e9;}}
  }catch(e){}
  renderPC();}
 
@@ -207,11 +227,15 @@ async function renderPC(){
   try{const r=await fetch('/screen/'+emp,{headers:{authorization:'Bearer '+tok()}});
    if(r.ok){const b=new Uint8Array(await r.arrayBuffer());let s='';for(let i=0;i<b.length;i+=8192)s+=String.fromCharCode.apply(null,b.subarray(i,i+8192));img='<img class="frame" src="data:image/png;base64,'+btoa(s)+'">';}
   }catch(e){}}
- $('pc').innerHTML='<h4>'+esc(sel||'')+String.fromCharCode(39)+'s computer</h4>'
-  +'<div class="monitor'+(img?' shimmer':'')+'"><div class="bar"><i></i><i></i><i></i><span class="live">'+(img?'● LIVE':'HEADLESS')+'</span></div>'
+ // honest label: LIVE only if the newest activity is fresh, else say how stale it is
+ const lastT=(evs&&evs[0])?evs[0].t:null;
+ const fresh=lastT&&(Date.now()-new Date(lastT))<600000;
+ $('pc').innerHTML='<div id="pchead"><span>'+esc(sel||'')+String.fromCharCode(39)+'s computer</span><button class="paneltoggle" id="pcx" title="hide">✕</button></div>'
+  +'<div class="monitor'+(img&&fresh?' shimmer':'')+'"><div class="bar"><i></i><i></i><i></i><span class="live">'+(img?(fresh?'● LIVE':'LAST ACTIVE '+ago(lastT)+' AGO'):'HEADLESS')+'</span></div>'
   +(img||'<div class="off">No screen frames - this staffer works headless right now. The feed below is their monitor.</div>')+'</div>'
   +'<h4>What they'+String.fromCharCode(39)+'re doing</h4>'
-  +((evs||[]).map(e=>'<div class="ev"><b>'+esc(e.action)+'</b>'+(e.detail?'<div class="d">'+esc(e.detail)+'</div>':'')+'<div class="t">'+ago(e.t)+' ago</div></div>').join('')||'<div class="ev" style="color:var(--dim)">Nothing logged yet.</div>');}
+  +((evs||[]).map(e=>'<div class="ev"><b>'+esc(e.action)+'</b>'+(e.detail?'<div class="d">'+esc(e.detail)+'</div>':'')+'<div class="t">'+ago(e.t)+' ago</div></div>').join('')||'<div class="ev" style="color:var(--dim)">Nothing logged yet.</div>');
+ const px=$('pcx');if(px)px.onclick=()=>{PS.pc=false;savePanels();};}
 
 async function send(){
  const v=$('box').value.trim();if(!v)return;$('box').value='';
@@ -226,19 +250,48 @@ async function send(){
 $('gbtn').onclick=async()=>{
  const em=$('em').value.trim(),pw=$('tk').value;
  // Escape hatch for self-hosters: paste the machine key in the email box to get straight in.
- if(em&&!em.includes('@')){localStorage.setItem('office_token',em);localStorage.setItem('office_name','You');$('gate').style.display='none';boot();return;}
+ // The server records root sends under OWNER_NAME, so mirror its default here.
+ if(em&&!em.includes('@')){localStorage.setItem('office_token',em);localStorage.setItem('office_name','Owner');$('gate').style.display='none';boot();return;}
  try{
   const r=await fetch('/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:em,password:pw})});
   const d=await r.json();
-  if(!d.ok){$('gerr').textContent=d.error||'sign-in failed';$('gerr').style.color='#f87171';return;}
-  localStorage.setItem('office_token',d.token);localStorage.setItem('office_name',d.name||'You');
+  if(!d.ok){
+   $('gerr').textContent=d.error||'sign-in failed';$('gerr').style.color='#f87171';
+   if(/trial has ended/i.test(d.error||''))$('gerr').innerHTML+=' <a href="#upgrade" style="color:var(--acc)">Upgrade →</a>';
+   return;}
+  localStorage.setItem('office_token',d.token);localStorage.setItem('office_name',d.name||'You');localStorage.setItem('office_plan',d.plan||'');
+  if(d.trial_ends)localStorage.setItem('office_trial_ends',d.trial_ends);else localStorage.removeItem('office_trial_ends');
   $('gate').style.display='none';boot();
  }catch(e){$('gerr').textContent='network error - try again';$('gerr').style.color='#f87171';}
 };
 $('tk').addEventListener('keydown',e=>{if(e.key==='Enter')$('gbtn').click();});
+$('gsign').onclick=async()=>{
+ const em=$('em').value.trim(),pw=$('tk').value;
+ if(!em.includes('@')||pw.length<6){$('gerr').textContent='enter an email and a 6+ character password, then press the trial button';$('gerr').style.color='#fbbf24';return;}
+ try{
+  const r=await fetch('/auth/signup',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email:em,password:pw})});
+  const d=await r.json();
+  if(!d.ok){$('gerr').textContent=d.error||'signup failed';$('gerr').style.color='#f87171';return;}
+  $('gerr').textContent='trial started - clocking you in...';$('gerr').style.color='var(--ok)';
+  $('gbtn').click();
+ }catch(e){$('gerr').textContent='network error - try again';$('gerr').style.color='#f87171';}
+};
+$('fab').onclick=()=>{PS.rail=true;if(innerWidth<=1150)PS.pc=false;savePanels();};
+applyPanels();
+const so=document.getElementById('signout');
+if(so)so.onclick=()=>{['office_token','office_name','office_plan','office_trial_ends'].forEach(k=>localStorage.removeItem(k));location.href=location.pathname;};
 async function boot(){
- if(DEMO){$('demobadge').style.display='inline';await loadRoster();return;}
+ if(DEMO){$('demobadge').style.display='inline';await loadRoster();pick('Ada');return;} // demo lands on a live desk, never an empty pane
+ const db=$('demobadge'); if(db)db.remove(); // real mode: badge gone (null-safe: boot reruns after login)
  if(!tok()){$('gate').style.display='grid';return;}
+ const te=localStorage.getItem('office_trial_ends');
+ if(te&&localStorage.getItem('office_plan')==='trial-1day'&&!$('trialbar')){
+  const hrs=Math.max(0,Math.round((new Date(te)-Date.now())/36e5));
+  const tb=document.createElement('div');tb.id='trialbar';
+  tb.style.cssText='margin:10px 10px 2px;padding:9px 12px;border:1px solid rgba(251,191,36,.35);border-radius:10px;background:linear-gradient(135deg,#221809,#171008);color:#fbbf24;font-size:12px;line-height:1.5;box-shadow:var(--raise)';
+  tb.innerHTML='<b>Free trial - '+hrs+'h left</b><br><span style="color:var(--dim)">This staffroom is private to you. Your staff wake the moment you message them.</span>';
+  $('rail').insertBefore(tb,$('emps'));
+ }
  await loadRoster();setInterval(loadRoster,30000);}
 boot();
 `;

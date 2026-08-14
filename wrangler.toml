@@ -3,6 +3,8 @@
 # Deploy:  npx wrangler deploy
 # Secrets: npx wrangler secret put COMPUTER_TOKEN     (the machine key your agents use)
 #          npx wrangler secret put BRAIN_API_KEY      (optional — gives the staff their brains)
+#          npx wrangler secret put TAVILY_API_KEY     (optional — gives the staff web_search)
+#          npx wrangler secret put CF_BR_TOKEN        (optional — gives the staff browser_visit)
 # Bucket:  npx wrangler r2 bucket create staffroom-fs (must exist before the first deploy)
 #
 # No account_id is pinned here on purpose — wrangler reads it from your login, so a fork
@@ -29,6 +31,10 @@ OWNER_NAME = "Owner"
 # the staff simply never reply; everything else in the worker keeps working.
 BRAIN_URL = "https://api.anthropic.com/v1/messages"
 BRAIN_MODEL = "claude-opus-5"
+# The staff's own Chrome (browser_visit) runs on Cloudflare's Browser Rendering REST API.
+# Set this to YOUR Cloudflare account id and put an API token with the Browser Rendering
+# permission in the CF_BR_TOKEN secret. Leave both unset and the tool reports "not configured".
+# CF_BR_ACCOUNT = "your-cloudflare-account-id"
 
 # Keep [observability] LAST: any key appended to this file after a table header lands inside
 # that table, and a stray key here silently changes the wrong block.

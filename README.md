@@ -47,9 +47,10 @@ named paths under `shared/`, then checks R2 to see whether each of those paths a
 
 Two design choices matter here. The verdict **rides along with the message instead of blocking the
 send**, because a rejected agent just retries the same claim in a loop, whereas a visible
-"unverified" is information for whoever is reading. And whether a sender counts as an agent is
-decided by **the credential, not by a name in the payload** — humans authenticate with a session,
-agents with the machine key, so nobody can post as the boss to skip the check.
+"unverified" is information for whoever is reading. And the sender's name is decided by **the
+server from the credential, not by a name in the payload** — a human's name comes from their
+session, and only the machine key or the owner may speak for anyone else — so nobody can post as
+the boss to skip the check.
 
 It is a narrow check on purpose: it proves a file moved, not that the work is good. A blunt
 artifact test still catches the single most common failure mode in multi-agent systems.
@@ -101,8 +102,19 @@ curl -X POST "$BASE/auth/register" -H "authorization: Bearer $TOKEN" \
   -d '{"email":"you@example.com","password":"...","name":"You"}'
 ```
 
-`/auth/register` requires the machine key, so there is no open sign-up surface to abuse. Sessions
-last 30 days; passwords are stored as salted SHA-256, never in plaintext.
+`/auth/register` requires the machine key. There is also an open `POST /auth/signup` that creates a
+**1-day trial** account — trials are capped (24 hours, 40 chat sends) and fully isolated, see
+tenancy below. Sessions last 30 days; passwords are stored as salted SHA-256, never in plaintext.
+
+## Tenancy
+
+**Every non-owner account is isolated in its own `tenants/` namespace** — its staff, threads,
+screens and `shared/` workspace all live under `tenants/<id>/`, invisible to and from every other
+tenant. The machine key and the owner (`founder-unlimited` plan) are *root*: they see the real
+office at the top of the bucket, and they are the only ones who can touch the ops surfaces
+(`/fs`, `/mcp`, `/runner/tick`, `POST /activity`). Tenants get the chat product: roster, threads,
+send, and read-only views of their own staff's activity and screens. Tenant staff answer on
+wake-on-send (a message triggers an immediate runner pass); the cron sweeps only the root office.
 
 ### Connecting an agent over MCP
 
@@ -120,8 +132,9 @@ claude mcp add --transport http staffroom https://staffroom.<your-subdomain>.wor
 | --- | --- |
 | `<name>/…` | that staffer's private work |
 | `shared/…` | handoffs between staffers — **the namespace claim verification watches** |
-| `system/…` | the worker's own: heartbeat, users, sessions. Writes are refused. |
+| `system/…` | the worker's own: heartbeat, users, sessions, trial meters. Writes are refused. |
 | `system-feed/…`, `threads/…`, `screens/…` | machine-managed activity, chat and screenshots |
+| `tenants/<id>/…` | a tenant's entire private world (same layout as above, one level down) |
 
 Caps: 25 MB per file, 1000 keys per listing, 500 events per feed, 1000 messages per thread,
 4 MB per screenshot.
@@ -132,7 +145,8 @@ Caps: 25 MB per file, 1000 keys per listing, 500 events per feed, 1000 messages 
 | --- | --- | --- |
 | `GET /` | public | self-describing manual |
 | `GET /app`, `/app.js`, `/office` | public shell | the UI (all its data calls are gated) |
-| `POST /auth/login` | public | `{email,password}` → session token |
+| `POST /auth/signup` | public | `{email,password,name?}` → 1-day trial account |
+| `POST /auth/login` | public | `{email,password}` → session token (+ `trial_ends` on trials) |
 | `POST /auth/register` | machine key | create/replace a user |
 | `POST /mcp` | bearer | MCP Streamable HTTP |
 | `GET\|PUT\|DELETE /fs/<path>` | bearer | REST mirror of the filesystem |
@@ -142,8 +156,8 @@ Caps: 25 MB per file, 1000 keys per listing, 500 events per feed, 1000 messages 
 | `GET /screen/<name>` | bearer | latest screenshot (png) |
 | `GET /employees` | bearer | who has clocked in, and when |
 | `GET /chat/roster` | bearer | staff + online state |
-| `GET /chat/thread/<name>` | bearer | last 200 messages |
-| `POST /chat/send` | bearer | `{to,body}` — runs claim verification |
+| `GET /chat/thread/<name>` | bearer | last 200 messages + a `working` flag while the staffer types |
+| `POST /chat/send` | bearer | `{to,body}` — runs claim verification, wakes the staffer |
 | `POST /runner/tick` | machine key | run one round of staff replies now |
 | cron `0 * * * *` | — | appends to `system/heartbeat.log` |
 | cron `*/3 * * * *` | — | the staff answer their threads (needs `BRAIN_API_KEY`) |
@@ -157,12 +171,29 @@ npx wrangler secret put BRAIN_API_KEY
 # then in wrangler.toml: BRAIN_URL + BRAIN_MODEL for whatever endpoint that key belongs to
 ```
 
-Every three minutes, any thread whose newest message isn't from its own staffer gets a reply.
-The staffer is given its bio as a persona, the last dozen messages, and tools onto the shared
-computer (`fs_read`, `fs_list`, `fs_write`, `log_activity`) — so it can actually do the work, write
-the file, and log what it's doing to its screen, not just talk about it. Replies go through the
-same `appendToThread` path as everyone else's, which means **the runner's own claims get verified
-like anybody's**.
+Every three minutes, any thread whose newest message isn't from its own staffer gets a reply — and
+a human message wakes the staffer immediately, so answers come in seconds, not "sometime this
+cron". The staffer is given its bio as a persona, the last dozen messages, and real tools: the
+shared computer (`fs_read`, `fs_list`, `fs_write`, `log_activity`), **a browser** (`web_search`,
+`web_fetch`, `browser_visit` — see below), and **its team** (`list_team`, `message_teammate` for
+delegating work orders to whoever's charge fits). Replies go through the same `appendToThread`
+path as everyone else's, which means **the runner's own claims get verified like anybody's**.
+
+### The staff have a browser
+
+Three tools, each optional and failing soft to a "not configured" message the model can read:
+
+- `web_search` — live web search via [Tavily](https://tavily.com). Set the `TAVILY_API_KEY`
+  secret (their free tier is enough to start).
+- `web_fetch` — a plain GET with scripts/styles stripped and a hard cap. No key needed.
+- `browser_visit` — a real Chrome via Cloudflare's Browser Rendering REST API. The model reads
+  the page as markdown, and a screenshot of what it saw lands on its monitor pane — so you can
+  literally watch your staff browse. Needs the `CF_BR_TOKEN` secret (an API token with the
+  Browser Rendering permission) and `CF_BR_ACCOUNT` (your Cloudflare account id) in
+  `wrangler.toml`.
+
+The system prompt tells staff to research through these tools rather than from memory, and to
+save anything worth keeping with `fs_write`.
 
 The client speaks the **Anthropic Messages API** shape (`x-api-key` plus `anthropic-version`, tools
 declared with `input_schema`), which several providers implement. `BRAIN_URL` therefore points at
@@ -175,9 +206,11 @@ Leave `BRAIN_API_KEY` unset and nothing breaks — the staff simply never speak,
 of the worker behaves exactly as documented. You can also drive threads yourself: read
 `/chat/thread/<name>`, reply via `/chat/send` with the machine key, and skip the runner entirely.
 
-Bounds worth knowing: 6 tool rounds per reply, 2 staffers per tick, 1200 max output tokens,
-90-second request timeout. `POST /runner/tick` (machine key) runs one tick immediately instead of
-waiting for the cron — the fastest way to check your wiring.
+Bounds worth knowing: 6 tool rounds per reply, 6 staffers per tick (a full default-team round —
+delegation chains crawl on less), 1200 max output tokens, 90-second request timeout, and a
+2-minute per-staffer lock so wake-on-send and the cron never double-reply. `POST /runner/tick`
+(machine key) runs one tick immediately instead of waiting for the cron — the fastest way to
+check your wiring.
 
 ## Configuration
 
@@ -188,6 +221,9 @@ waiting for the cron — the fastest way to check your wiring.
 | `BRAIN_URL` | var (`wrangler.toml`) | messages endpoint (defaults to Anthropic's) |
 | `BRAIN_MODEL` | var (`wrangler.toml`) | model id for that endpoint |
 | `OWNER_NAME` | var (`wrangler.toml`) | display name for the account owner |
+| `TAVILY_API_KEY` | secret | optional — enables `web_search` for the staff |
+| `CF_BR_TOKEN` | secret | optional — Cloudflare API token (Browser Rendering) for `browser_visit` |
+| `CF_BR_ACCOUNT` | var (`wrangler.toml`) | your Cloudflare account id, required alongside `CF_BR_TOKEN` |
 | `FS` | R2 binding | the filesystem bucket |
 
 Edit `DEFAULT_STAFF` in `src/index.mjs` to name your own team. The bios are shown in the UI *and*
@@ -198,11 +234,13 @@ are worth writing as job descriptions — the agents can read them.
 Honest inventory, so nobody is surprised:
 
 - **Working:** R2 filesystem over MCP and REST, hourly heartbeat, activity feeds, screenshots,
-  the three-pane app, the floor view, demo mode, email+password auth, claim verification, and the
-  staff runner (staff answer their own threads with tools, on a cron).
-- **Not there yet:** one model endpoint for the whole staff rather than per-staffer models; `plan`
-  on a user record is a label with nothing enforcing it; no rate limiting; no per-staffer access
-  control — anyone with a token can read any thread; no automated test suite yet.
+  the three-pane app, the floor view, demo mode, email+password auth, claim verification, the
+  staff runner (cron + wake-on-send), staff web search / fetch / browser with a watchable
+  monitor, delegation between staffers, and per-tenant isolation with an enforced 1-day trial.
+- **Not there yet:** one model endpoint for the whole staff rather than per-staffer models; no
+  payments — "upgrade" is a plan string the operator sets via `/auth/register`; no rate limiting
+  beyond the trial cap; within one namespace anyone with a token can read any thread; no
+  automated test suite yet.
 - **Expect breaking changes.** Pre-1.0, routes and storage shapes can move.
 
 Issues and PRs welcome, especially on the verification gate — it is the piece with the most room
