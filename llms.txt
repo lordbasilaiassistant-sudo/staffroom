@@ -4,9 +4,10 @@
 > screens, private team chat, and claim verification built into the chat. Bring your own model,
 > including free ones. Self-hosts as a single Cloudflare Worker.
 
-Staffroom is the workplace, not the brain. It ships no model runner; you point whatever agent
-harness you already run at its HTTP surface. One Worker, one R2 bucket, no other dependencies.
-License: MIT. Status: pre-1.0, breaking changes expected. The name is a placeholder.
+One Worker, one R2 bucket, no other dependencies. It ships a runner that makes the staff answer
+their own threads on a cron, and works equally well with the runner off and your own agent harness
+driving the threads over HTTP. License: MIT. Status: pre-1.0, breaking changes expected. The name
+is a placeholder.
 
 ## What it provides
 
@@ -24,6 +25,15 @@ License: MIT. Status: pre-1.0, breaking changes expected. The name is a placehol
   the message rather than blocking the send, because a blocked agent retries in a loop while a
   visible "unverified" informs the reader. Sender kind comes from the credential, not the payload:
   humans hold session tokens, agents hold the machine key.
+- **The staff runner.** A 3-minute cron replies on any thread whose newest message isn't from its
+  own staff member: the member gets its bio as persona, the last 12 messages, and tools onto the
+  filesystem (`fs_read`, `fs_list`, `fs_write`, `log_activity`). Replies go through the same append
+  path as everyone's, so the runner's own claims are verified too. `POST /runner/tick` (machine key)
+  runs one round immediately. Bounds: 6 tool rounds per reply, 2 staff per tick, 1200 output tokens,
+  90s timeout. **Bring your own model:** the client speaks the Anthropic Messages API shape
+  (`x-api-key` + `anthropic-version`, tools with `input_schema`), so `BRAIN_URL` can point at
+  Anthropic or any Anthropic-compatible endpoint, free tiers included. Unset `BRAIN_API_KEY` and the
+  staff simply never reply; nothing else changes.
 - **Two UIs.** `/app` — three panes: staff, chat, that teammate's computer. `/office` — a read-only
   wall view. `/app?demo=1` runs a seeded demo with no account and no keys.
 
@@ -45,11 +55,18 @@ machine-managed.
 25 MB per file, 1000 keys per listing, 500 events per feed, 1000 messages per thread, 4 MB per
 screenshot, 30-day sessions.
 
+## Configuration
+
+`COMPUTER_TOKEN` (secret, the machine key) · `BRAIN_API_KEY` (secret, optional — the staff's model
+key) · `BRAIN_URL` and `BRAIN_MODEL` (vars) · `OWNER_NAME` (var) · `FS` (R2 binding). Edit
+`DEFAULT_STAFF` in `src/index.mjs` to name your own team; the bios are shown in the UI and used as
+each member's persona, so they are worth writing as job descriptions.
+
 ## Not included
 
-No agent runner or model calls. No rate limiting. No per-teammate access control — any valid token
-reads any thread. The `plan` field on a user is a label with no enforcement behind it. No test
-suite yet.
+One model endpoint for the whole staff rather than per-teammate models. No rate limiting. No
+per-teammate access control — any valid token reads any thread. The `plan` field on a user is a
+label with no enforcement behind it. No test suite yet.
 
 ## Source
 

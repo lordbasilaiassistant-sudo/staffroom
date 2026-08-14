@@ -12,7 +12,9 @@
  *   POST /activity   — a staff member broadcasts what it is doing (+ an optional screenshot).
  *   GET  /activity/<name> · GET /screen/<name> · GET /employees — the watch surfaces.
  *   GET  /chat/roster · /chat/thread/<name> · POST /chat/send   — private team chat.
+ *   POST /runner/tick — make the staff answer their threads now (machine key only).
  *   GET  /app · /app.js · /office — the UI. GET / — a self-describing manual (public).
+ *   cron every 3 min — the staff answer their threads (see runner.mjs; needs BRAIN_API_KEY).
  *   cron hourly      — appends a line to system/heartbeat.log (the machine-is-up proof).
  *
  * AUTH: Authorization: Bearer <token>, where the token is either COMPUTER_TOKEN (the machine key
@@ -27,6 +29,7 @@
 
 import { OFFICE_HTML } from './office.mjs';
 import { APP_HTML, APP_JS } from './app.mjs';
+import { runTick } from './runner.mjs';
 
 const JSONH = { 'content-type': 'application/json; charset=utf-8' };
 const err = (status, message) => new Response(JSON.stringify({ ok: false, error: message }), { status, headers: JSONH });
@@ -41,6 +44,10 @@ const MAX_BYTES = 25 * 1024 * 1024;
  *   GET  /screen/<employee> — the latest screenshot (image/png), 404 if none yet.
  * Events live at system-feed/<employee>.jsonl (machine-owned namespace, capped at the last 500). */
 const FEED_CAP = 500;
+
+// Which cron expression means "let the staff answer their threads" rather than "write a heartbeat".
+// Must match the entry in wrangler.toml — the scheduled handler receives the expression verbatim.
+const RUNNER_CRON = '*/3 * * * *';
 
 /* The default team. Replace these with your own — the bio doubles as the member's job
  * description, so it is worth writing as if the agent will read it (it can). */
@@ -85,6 +92,7 @@ const MANUAL = {
   conventions: '<name>/... private · shared/... handoffs · system/... machine-owned (read-only to you)',
   heartbeat: 'GET /fs/system/heartbeat.log — one line per hour, written whether or not any PC is awake',
   ui: 'GET /app (sign in) · GET /app?demo=1 (seeded demo, no account needed)',
+  brains: 'Staff reply on a 3-minute cron when BRAIN_API_KEY and BRAIN_MODEL are set; POST /runner/tick to run one now',
   source: 'https://github.com/lordbasilaiassistant-sudo/staffroom',
 };
 
@@ -139,6 +147,47 @@ async function runTool(env, name, args) {
     default:
       throw { code: -32601, msg: `unknown tool "${name}"` };
   }
+}
+
+/* Append a message to a staff member's thread, applying CLAIM VERIFICATION.
+ *
+ * Language models — especially cheap ones — report "done" when the artifact never landed, and a
+ * chat transcript full of confident completions is worth nothing on its own. So the platform
+ * checks, inside the chat: when an AGENT's message sounds like completion, find the last work
+ * order in the thread that named shared/ paths and verify each of those paths actually changed
+ * AFTER that order was posted. The verdict rides along with the message rather than blocking the
+ * send, because a rejected agent just retries the same claim in a loop, whereas a visible
+ * "unverified" is information for whoever is reading.
+ *
+ * `isAgent` comes from the caller's credential, never from a name in the payload — see authInfo.
+ * Returns the verify object, or null when there was nothing to check. */
+async function appendToThread(env, who, from, body, isAgent) {
+  const key = `threads/${who}.jsonl`;
+  const prev = await env.FS.get(key);
+  let lines = prev ? (await prev.text()).split('\n').filter(Boolean) : [];
+  const msg = { from, body: String(body).slice(0, 8000), created_at: new Date().toISOString() };
+  const claimsDone = isAgent && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back)\b/i.test(msg.body);
+  if (claimsDone) {
+    const order = [...lines].reverse().map((l) => JSON.parse(l)).find((m) => m.from !== from && /shared\/[\w\/.-]+/.test(m.body));
+    if (order) {
+      const paths = [...new Set((order.body.match(/shared\/[\w\/.-]+/g) || []).map((x) => x.replace(/[.,;:]+$/, '')))];
+      const checked = [];
+      for (const p of paths.slice(0, 10)) {
+        const isDir = !/\.[a-z0-9]+$/i.test(p);
+        const list = await env.FS.list({ prefix: p.replace(/\/$/, '') + (isDir ? '/' : ''), limit: 20 });
+        const objs = isDir ? list.objects : (list.objects.length ? list.objects : (await env.FS.list({ prefix: p, limit: 5 })).objects);
+        const changed = objs.some((o) => new Date(o.uploaded) > new Date(order.created_at));
+        checked.push({ path: p, changed });
+      }
+      if (checked.length) {
+        msg.verify = { verdict: checked.every((c) => c.changed) ? 'verified' : 'unverified', checked, order_at: order.created_at };
+      }
+    }
+  }
+  lines.push(JSON.stringify(msg));
+  if (lines.length > 1000) lines = lines.slice(-1000);
+  await env.FS.put(key, lines.join('\n') + '\n');
+  return msg.verify || null;
 }
 
 const rpcResult = (id, result) => ({ jsonrpc: '2.0', id, result });
@@ -260,6 +309,14 @@ export default {
     }
     if (u.pathname === '/mcp' && req.method === 'POST') return handleMcp(req, env);
 
+    // Manual runner trigger (machine key only) — for testing, and for draining threads on demand
+    // rather than waiting for the next cron tick.
+    if (u.pathname === '/runner/tick' && req.method === 'POST') {
+      if (me.kind !== 'machine') return err(403, 'machine key required');
+      const results = await runTick(env, { runTool, postActivity, appendToThread, staff: DEFAULT_STAFF });
+      return new Response(JSON.stringify({ ok: true, results }), { headers: JSONH });
+    }
+
     if (u.pathname === '/activity' && req.method === 'POST') {
       try {
         const body = await req.json();
@@ -300,41 +357,8 @@ export default {
       // for humans, or anyone could post as the boss.
       const isHuman = me.kind === 'session';
       const from = isHuman ? me.name : String(b.from || 'agent').slice(0, 40);
-      const key = `threads/${who}.jsonl`;
-      const prev = await env.FS.get(key);
-      let lines = prev ? (await prev.text()).split('\n').filter(Boolean) : [];
-      const msg = { from, body: String(b.body).slice(0, 8000), created_at: new Date().toISOString() };
-
-      /* CLAIM VERIFICATION. Language models — especially cheap ones — report "done" when the
-       * artifact never landed, and a chat transcript full of confident completions is worth
-       * nothing on its own. So the platform checks, inside the chat: when an AGENT's message
-       * sounds like completion, find the last work order that named shared/ paths and verify
-       * each of those paths actually changed AFTER that order was posted. The verdict rides
-       * along with the message rather than blocking it — a displayed "unverified" is more use
-       * than a rejected send, which just makes the agent loop. */
-      const claimsDone = !isHuman && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back)\b/i.test(msg.body);
-      if (claimsDone) {
-        const order = [...lines].reverse().map((l) => JSON.parse(l)).find((m) => m.from !== from && /shared\/[\w\/.-]+/.test(m.body));
-        if (order) {
-          const paths = [...new Set((order.body.match(/shared\/[\w\/.-]+/g) || []).map((x) => x.replace(/[.,;:]+$/, '')))];
-          const checked = [];
-          for (const p of paths.slice(0, 10)) {
-            const isDir = !/\.[a-z0-9]+$/i.test(p);
-            const list = await env.FS.list({ prefix: p.replace(/\/$/, '') + (isDir ? '/' : ''), limit: 20 });
-            const objs = isDir ? list.objects : (list.objects.length ? list.objects : (await env.FS.list({ prefix: p, limit: 5 })).objects);
-            const changed = objs.some((o) => new Date(o.uploaded) > new Date(order.created_at));
-            checked.push({ path: p, changed });
-          }
-          if (checked.length) {
-            msg.verify = { verdict: checked.every((c) => c.changed) ? 'verified' : 'unverified', checked, order_at: order.created_at };
-          }
-        }
-      }
-
-      lines.push(JSON.stringify(msg));
-      if (lines.length > 1000) lines = lines.slice(-1000);
-      await env.FS.put(key, lines.join('\n') + '\n');
-      return new Response(JSON.stringify({ ok: true, from, verify: msg.verify || null }), { headers: JSONH });
+      const verify = await appendToThread(env, who, from, b.body, !isHuman);
+      return new Response(JSON.stringify({ ok: true, from, verify }), { headers: JSONH });
     }
 
     if (u.pathname === '/employees' && req.method === 'GET') {
@@ -383,8 +407,14 @@ export default {
     return new Response(JSON.stringify({ ok: false, error: 'unknown route — GET / for the manual' }), { status: 404, headers: JSONH });
   },
 
-  async scheduled(_event, env) {
-    // The proof that the computer outlives your laptop: one line per hour, written by the edge.
+  async scheduled(event, env) {
+    // Frequent cron: the staff answer their threads. Wrapped in try/catch because a brain outage
+    // must not take the heartbeat down with it.
+    if (event.cron === RUNNER_CRON) {
+      try { await runTick(env, { runTool, postActivity, appendToThread, staff: DEFAULT_STAFF }); } catch {}
+      return;
+    }
+    // Hourly cron: the proof that the computer outlives your laptop — one line per hour, from the edge.
     const key = 'system/heartbeat.log';
     const prev = await env.FS.get(key);
     let text = prev ? await prev.text() : '';

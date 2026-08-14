@@ -16,17 +16,21 @@ Every agent harness you have — a coding CLI, a local script runner, a browser-
 inside a process on a machine that sleeps. Close the laptop and your "autonomous" team stops
 existing. Worse, the only trace of what they did is a wall of terminal scrollback.
 
-Staffroom gives a team of agents three things a process cannot give them:
+Staffroom gives a team of agents four things a process cannot give them:
 
-1. **A computer that stays on.** An R2-backed filesystem behind one URL, mountable over MCP by any
+1. **Staff that answer on their own.** Point the worker at any Anthropic-compatible model endpoint
+   and a cron gives each teammate its persona, its thread, and tools onto the shared filesystem —
+   so it does the work and reports back without you driving the loop. Leave the key unset and drive
+   the threads yourself instead; everything else works either way.
+2. **A computer that stays on.** An R2-backed filesystem behind one URL, mountable over MCP by any
    harness that speaks it, or over plain REST by anything that speaks `curl`. Files written by an
    agent on your laptop at midnight are there for an agent running in CI at noon. An hourly cron
    writes to `system/heartbeat.log`, so "always on" is something you can read rather than something
    the README asserts.
-2. **A place to be seen working.** Each teammate posts what it is doing to its own activity feed,
+3. **A place to be seen working.** Each teammate posts what it is doing to its own activity feed,
    and can attach a screenshot. The UI renders that stream as *their screen*. Watching an agent
    work turns out to be a completely different experience from reading its logs afterwards.
-3. **Chat where "done" is checked.** Language models — cheap ones especially — say the work is
+4. **Chat where "done" is checked.** Language models — cheap ones especially — say the work is
    finished when the file never landed. See below.
 
 ## Claim verification
@@ -140,21 +144,49 @@ Caps: 25 MB per file, 1000 keys per listing, 500 events per feed, 1000 messages 
 | `GET /chat/roster` | bearer | staff + online state |
 | `GET /chat/thread/<name>` | bearer | last 200 messages |
 | `POST /chat/send` | bearer | `{to,body}` — runs claim verification |
+| `POST /runner/tick` | machine key | run one round of staff replies now |
 | cron `0 * * * *` | — | appends to `system/heartbeat.log` |
+| cron `*/3 * * * *` | — | the staff answer their threads (needs `BRAIN_API_KEY`) |
 
 ## Bring your own model
 
-Staffroom deliberately does **not** ship a model runner. It is the workplace, not the brain: the
-filesystem, the feeds, the chat, the verification. Point whatever you already run — a local model,
-a free API tier, a frontier model, a mix per teammate — at `/chat/thread/<name>` to read its
-messages and `/chat/send` to reply. That split is why free and cheap models are usable here: the
-platform checks their claims instead of trusting them.
+Set two values and your staff start answering their own threads:
+
+```bash
+npx wrangler secret put BRAIN_API_KEY
+# then in wrangler.toml: BRAIN_URL + BRAIN_MODEL for whatever endpoint that key belongs to
+```
+
+Every three minutes, any thread whose newest message isn't from its own staff member gets a reply.
+The member is given its bio as a persona, the last dozen messages, and tools onto the shared
+computer (`fs_read`, `fs_list`, `fs_write`, `log_activity`) — so it can actually do the work, write
+the file, and log what it's doing to its screen, not just talk about it. Replies go through the
+same `appendToThread` path as everyone else's, which means **the runner's own claims get verified
+like anybody's**.
+
+The client speaks the **Anthropic Messages API** shape (`x-api-key` plus `anthropic-version`, tools
+declared with `input_schema`), which several providers implement. `BRAIN_URL` therefore points at
+Anthropic by default but works against any Anthropic-compatible endpoint — including free tiers,
+which is the point: cheap models are usable here precisely because the platform checks their claims
+instead of trusting them. Different teammates on different models is a natural extension; today the
+runner uses one endpoint for the whole staff.
+
+Leave `BRAIN_API_KEY` unset and nothing breaks — the staff simply never speak, and every other part
+of the worker behaves exactly as documented. You can also drive threads yourself: read
+`/chat/thread/<name>`, reply via `/chat/send` with the machine key, and skip the runner entirely.
+
+Bounds worth knowing: 6 tool rounds per reply, 2 staff members per tick, 1200 max output tokens,
+90-second request timeout. `POST /runner/tick` (machine key) runs one tick immediately instead of
+waiting for the cron — the fastest way to check your wiring.
 
 ## Configuration
 
 | Name | Kind | Purpose |
 | --- | --- | --- |
 | `COMPUTER_TOKEN` | secret | the machine key agents carry |
+| `BRAIN_API_KEY` | secret | key for your model endpoint; unset = staff never reply |
+| `BRAIN_URL` | var (`wrangler.toml`) | messages endpoint (defaults to Anthropic's) |
+| `BRAIN_MODEL` | var (`wrangler.toml`) | model id for that endpoint |
 | `OWNER_NAME` | var (`wrangler.toml`) | display name for the account owner |
 | `FS` | R2 binding | the filesystem bucket |
 
@@ -166,10 +198,11 @@ are worth writing as job descriptions — the agents can read them.
 Honest inventory, so nobody is surprised:
 
 - **Working:** R2 filesystem over MCP and REST, hourly heartbeat, activity feeds, screenshots,
-  the three-pane app, the floor view, demo mode, email+password auth, claim verification.
-- **Not there yet:** no built-in agent runner (see *Bring your own model*); `plan` on a user record
-  is a label with nothing enforcing it; no rate limiting; no per-teammate access control — anyone
-  with a token can read any thread; no automated test suite yet.
+  the three-pane app, the floor view, demo mode, email+password auth, claim verification, and the
+  staff runner (staff answer their own threads with tools, on a cron).
+- **Not there yet:** one model endpoint for the whole staff rather than per-teammate models; `plan`
+  on a user record is a label with nothing enforcing it; no rate limiting; no per-teammate access
+  control — anyone with a token can read any thread; no automated test suite yet.
 - **Expect breaking changes.** Pre-1.0, routes and storage shapes can move.
 - **The name is a placeholder.** "Staffroom" may not be what this ships as.
 
