@@ -1,11 +1,10 @@
-/* The floor — a read-only wall view of everyone working at once. Served at GET /office.
- * The shell is public; the page asks for a token once, keeps it in localStorage, and every data
- * call it makes is bearer-gated. Lighter than /app: no chat, just roster + screen + feed.
- * One file, no dependencies. Polls /employees, /activity/<name>, /screen/<name>. */
+/* The Office — watch any employee work. Served at GET /office (public shell; the page asks for
+ * the computer token once and keeps it in localStorage — all data calls are bearer-gated).
+ * One file, no dependencies, premium-dark. Polls /employees, /activity/<emp>, /screen/<emp>. */
 export const OFFICE_HTML = `<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Staffroom — the floor</title>
+<title>The Office — broke2built</title>
 <style>
 :root{--bg:#0b0e14;--panel:#11151f;--panel2:#161b28;--line:#232a3a;--txt:#e6ebf4;--dim:#8b94a7;
 --acc:#5eead4;--acc2:#818cf8;--warn:#fbbf24;--glow:0 0 24px rgba(94,234,212,.15)}
@@ -52,7 +51,7 @@ background:var(--bg);color:var(--txt);font:inherit}
 color:#0b0e14;font-weight:700;cursor:pointer}
 .live{color:var(--acc);font-size:12px;letter-spacing:.08em}
 </style></head><body>
-<header><span class="dot"></span><h1>The floor</h1><span class="sub">watch your AI staff work</span></header>
+<header><span class="dot"></span><h1>The Office</h1><span class="sub">broke2built — watch the employees work</span></header>
 <div id="app"></div>
 <script>
 const P=['#5eead4','#818cf8','#fbbf24','#f472b6','#34d399','#f87171','#38bdf8','#c084fc'];
@@ -60,11 +59,11 @@ const col=n=>P[[...n].reduce((a,c)=>a+c.charCodeAt(0),0)%P.length];
 const tok=()=>localStorage.getItem('office_token');
 const app=document.getElementById('app');
 let sel=null,timer=null;
-function gate(){app.innerHTML='<div id="gate"><div class="card"><b>Staffroom key</b><div style="color:var(--dim);font-size:13px;margin-top:6px">Paste your machine token (COMPUTER_TOKEN) or a session token. Stored only in this browser.</div><input id="tk" type="password" placeholder="token"><button onclick="localStorage.setItem(\\'office_token\\',document.getElementById(\\'tk\\').value.trim());boot()">Enter</button></div></div>';}
+function gate(){app.innerHTML='<div id="gate"><div class="card"><b>Office key</b><div style="color:var(--dim);font-size:13px;margin-top:6px">Paste the computer token (ask Eli). Stored only in this browser.</div><input id="tk" type="password" placeholder="token"><button onclick="localStorage.setItem(\\'office_token\\',document.getElementById(\\'tk\\').value.trim());boot()">Enter the office</button></div></div>';}
 async function api(p){const r=await fetch(p,{headers:{authorization:'Bearer '+tok()}});if(r.status===401){gate();throw 0}return r;}
 function ago(t){const s=(Date.now()-new Date(t))/1e3;if(s<90)return Math.round(s)+'s ago';if(s<5400)return Math.round(s/60)+'m ago';if(s<172800)return Math.round(s/3600)+'h ago';return Math.round(s/86400)+'d ago';}
 async function boot(){if(!tok())return gate();
-app.innerHTML='<main><nav id="roster"><h2>Staff</h2><div id="list"></div></nav><section id="stage"><div class="placeholder">Pick a staffer to open their screen.<br><br>They post what they are doing as they work;<br>browser-driving staffers attach live screenshots.</div></section></main>';
+app.innerHTML='<main><nav id="roster"><h2>Employees</h2><div id="list"></div></nav><section id="stage"><div class="placeholder">Pick an employee to open their screen.<br><br>They post what they are doing as they work;<br>Chrome-driving employees attach live screenshots.</div></section></main>';
 await roster();}
 async function roster(){try{const d=await(await api('/employees')).json();
 const list=document.getElementById('list');if(!list)return;
@@ -74,7 +73,7 @@ async function pick(n){sel=n;clearInterval(timer);await render();timer=setInterv
 async function render(){if(!sel)return;const st=document.getElementById('stage');if(!st)return;
 let ev=[];try{ev=(await(await api('/activity/'+sel)).json()).events||[]}catch(e){}
 const shot=await fetch('/screen/'+sel,{headers:{authorization:'Bearer '+tok()}});
-const screen=shot.ok?'<img src="data:image/png;base64,'+btoa(String.fromCharCode(...new Uint8Array(await shot.arrayBuffer())))+'">':'<div class="noscreen">No screen frames yet — this staffer works headless. The action feed below is their monitor.</div>';
+const screen=shot.ok?'<img src="data:image/png;base64,'+btoa(String.fromCharCode(...new Uint8Array(await shot.arrayBuffer())))+'">':'<div class="noscreen">No screen frames yet — this employee works headless. The action feed below is their monitor.</div>';
 st.innerHTML='<div class="screenwrap"><div class="bar"><i></i><i></i><i></i><span style="margin-left:auto" class="live">● LIVE · '+sel.toUpperCase()+"'S SCREEN</span></div>"+screen+'</div><div class="feed"><h3>What they are doing</h3>'+(ev.map(e=>'<div class="ev"><div class="tick"></div><div><div class="action">'+esc(e.action)+'</div>'+(e.detail?'<div class="detail">'+esc(e.detail)+'</div>':'')+'<div class="t">'+new Date(e.t).toLocaleString()+'</div></div></div>').join('')||'<div style="color:var(--dim)">No events yet.</div>')+'</div>';}
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 window.pick=pick;window.boot=boot;boot();

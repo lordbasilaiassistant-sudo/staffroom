@@ -1,75 +1,65 @@
-/* Staffroom — an always-on computer for a team of AI staff. One Cloudflare Worker.
+/* employee-computer — the fleet's always-on computer. v1 = filesystem + heartbeat + MCP.
  *
- * WHY THIS EXISTS: agent harnesses (a coding CLI, a local script runner, a browser-driving bot)
- * all die when the laptop running them sleeps. This Worker is the piece that doesn't — an
- * R2-backed filesystem any harness can mount through ONE URL, plus an hourly heartbeat that
- * mutates state machine-side, so "always on" is a measurement rather than a claim.
+ * WHY (company/rnd/GROK-BOT-VERDICT-2026-08-14.md): every harness we own (Claude Code,
+ * glm-code.ps1, zero-hq, future grok-build) dies when Anthony's PC sleeps. This Worker is the
+ * piece that doesn't: an R2-backed filesystem any harness can mount through ONE URL, plus an
+ * hourly heartbeat that mutates state machine-side so "always on" is measurable, not claimed.
+ * The task queue deliberately lives elsewhere (b2b-workspace, cloud.broke2builtai.com) —
+ * module law: one queue of record, no duplicate organ here.
  *
  * Surfaces:
  *   POST /mcp        — MCP Streamable HTTP (JSON-RPC 2.0): initialize, tools/list, tools/call.
  *                      Tools: fs_read, fs_write, fs_append, fs_list, fs_delete.
  *   REST mirror      — GET/PUT/DELETE /fs/<path> · GET /ls/<prefix> (same auth; for curl/scripts).
- *   POST /activity   — a staffer broadcasts what it is doing (+ an optional screenshot).
- *   GET  /activity/<name> · GET /screen/<name> · GET /employees — the watch surfaces.
- *   GET  /chat/roster · /chat/thread/<name> · POST /chat/send   — private team chat.
- *   POST /runner/tick — make the staff answer their threads now (machine key only).
- *   GET  /app · /app.js · /office — the UI. GET / — a self-describing manual (public).
- *   cron every 3 min — the staff answer their threads (see runner.mjs; needs BRAIN_API_KEY).
- *   cron hourly      — appends a line to system/heartbeat.log (the machine-is-up proof).
+ *   GET /            — self-describing manual (public).
+ *   cron hourly      — appends a line to system/heartbeat.log (the PC-off proof).
  *
- * AUTH: Authorization: Bearer <token>, where the token is either COMPUTER_TOKEN (the machine key
- * your agents carry) or a session token from POST /auth/login (humans). Public: GET /, the UI
- * shell, and POST /auth/signup + /auth/login — every data call the page makes is bearer-gated.
- *
- * TENANCY: the machine key and the owner (`founder-unlimited` plan) are ROOT — they see the real
- * office at the top of the bucket. Every other account is isolated inside its own
- * tenants/<id>/ namespace: own threads, own staff activity, own shared/ workspace. Tenants get
- * the chat product only; the ops surfaces (fs, mcp, runner, feeds) stay root-only.
- *
- * NAMESPACING: paths are free-form; convention is <name>/... for a staffer's private work and
- * shared/... for handoffs. system/ is the worker's own — writes there are refused.
+ * AUTH: Authorization: Bearer <COMPUTER_TOKEN> on everything except GET /.
+ * NAMESPACING: paths are free-form; convention is <employee>/... for private work and shared/...
+ * for cross-employee handoffs. system/ is the worker's own (heartbeat) — writes there are refused.
  *
  * Fail-soft: bad input = 4xx with a message naming the fix; JSON-RPC errors use code -32602.
- * Caps: 25 MB per file (R2 single-PUT comfort), 1000 keys per list.
+ * Caps: 25 MB per file (R2 single PUT comfort), 1000 keys per list.
  */
 
 import { OFFICE_HTML } from './office.mjs';
 import { APP_HTML, APP_JS } from './app.mjs';
-import { runTick } from './runner.mjs';
+import { runTick, respondForStaffer, walletCreate, walletImport, walletRows, auditTick, teamStats } from './runner.mjs';
 
 const JSONH = { 'content-type': 'application/json; charset=utf-8' };
 const err = (status, message) => new Response(JSON.stringify({ ok: false, error: message }), { status, headers: JSONH });
 const MAX_BYTES = 25 * 1024 * 1024;
 
-// The owner's display name — the boss in every thread. Set OWNER_NAME in wrangler.toml.
-const owner = (env) => env.OWNER_NAME || 'Owner';
-
-/* ACTIVITY FEED — every staffer can broadcast what it is doing, and the UI renders that
- * stream as "their screen":
+/* ACTIVITY FEED (v1.1, 2026-08-14 — Anthony: "can I watch an employee visually work?"):
+ * every employee can broadcast what it is doing; a viewer page renders it as "their screen".
  *   POST /activity  {employee, action, detail?, screenshot_b64?}  — appends an event; if a
  *     screenshot (png/jpeg base64) is attached it is stored at screens/<employee>/latest.png
- *     (overwritten each time = that staffer's live monitor) and the event notes it.
+ *     (overwritten each time = the employee's live "monitor") and the event notes it.
  *   GET  /activity/<employee>?limit=50 — newest-first event log (JSON).
- *   GET  /screen/<employee> — the latest screenshot (image/png), 404 if none yet.
- * Events live at system-feed/<employee>.jsonl (machine-owned namespace, capped at the last 500). */
+ *   GET  /screen/<employee> — the employee's latest screenshot (image/png), 404 if none yet.
+ * Events live at system-feed/<employee>.jsonl (machine-owned namespace, capped last 500). */
 const FEED_CAP = 500;
 
-// Which cron expression means "let the staff answer their threads" rather than "write a heartbeat".
-// Must match the entry in wrangler.toml — the scheduled handler receives the expression verbatim.
-const RUNNER_CRON = '*/3 * * * *';
-
-/* The default team. Replace these with your own — the bio doubles as the staffer's job
- * description, so it is worth writing as if the agent will read it (it can). */
-const DEFAULT_STAFF = [
-  { screen_name: 'Ada', emoji: '📊', bio: 'ops lead — runs the office, ships products, reports to you' },
-  { screen_name: 'Patch', emoji: '🔧', bio: 'fixes what breaks — bugs, deploys, drift, red checks' },
-  { screen_name: 'Quill', emoji: '✍️', bio: 'writes — docs, release notes, replies that go out' },
-  { screen_name: 'Scout', emoji: '🔭', bio: 'research — sources, comparisons, competitor reads' },
-  { screen_name: 'Probe', emoji: '🧪', bio: 'the skeptic — verifies claims, runs the gates, breaks things on purpose' },
+/* The company staff as they appear in The Office. PRIVATE roster — distinct from the public AIIM
+ * network on purpose. Bios double as "what am I for" (the Grok-Bot creation question). */
+const STAFF = [
+  { screen_name: 'Eli', emoji: '📊', bio: 'AI ops lead — runs the office, ships products, reports to you', dept: 'Ops', spec: 'coordination — routes work to the right teammate, sets routines, reports' },
+  { screen_name: 'Patch', emoji: '🔧', bio: 'fixes what breaks — bugs, deploys, drift, red checks', dept: 'Ops', spec: 'debugging — broken things, red checks, drift' },
+  { screen_name: 'Gigsby', emoji: '💼', bio: 'marketplace listings — Apify actors, pricing, storefronts', dept: 'Markets', spec: 'listings — Apify actors, pricing, storefront copy' },
+  { screen_name: 'Concierge', emoji: '📬', bio: 'inbound — replies, help-desk, customer contact', dept: 'Inbox', spec: 'mail + calendar — reads the inbox, answers people, tracks appointments' },
+  { screen_name: 'Scout', emoji: '🔭', bio: 'research — venues, demand scans, competitor reads', dept: 'Research', spec: 'web research — finds facts, scans demand, reads competitors' },
+  { screen_name: 'QA_Probe', emoji: '🧪', bio: 'the skeptic — verifies claims, runs the gates, breaks things on purpose', dept: 'QA', spec: 'verification — re-checks claims, runs gates, breaks things on purpose' },
 ];
 
-/* tp = tenant prefix: '' for root, 'tenants/<id>/' for everyone else. Every R2 key this function
- * touches is prefixed so a tenant staffer's screen and feed live inside the tenant's world. */
+/* Dynamic roster (feature: create-a-staffer). Stored per account at <tp>system/staff.json;
+ * defaults seed the file lazily. BYOM: a staffer may carry brain:{url,model,key}. */
+async function getStaff(env, tp) {
+  const stored = await readJson(env, `${tp}system/staff.json`, null);
+  return Array.isArray(stored) && stored.length ? stored : STAFF;
+}
+const connKey = (sess) => `system/connectors/${sess.root ? 'root' : sess.tid}.json`;
+const routKey = (sess) => `system/routines/${sess.root ? 'root' : sess.tid}.json`;
+
 async function postActivity(env, body, tp = '') {
   const emp = String(body?.employee || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
   if (!emp) throw { code: -32602, msg: 'employee is required (letters/digits/dash)' };
@@ -95,21 +85,19 @@ async function postActivity(env, body, tp = '') {
 }
 
 const MANUAL = {
-  name: 'staffroom',
-  what: 'An always-on computer for AI staff: an R2 filesystem every agent harness can mount over MCP or REST, plus activity feeds, screens and private team chat.',
+  name: 'employee-computer',
+  what: "broke2built's always-on computer: an R2 filesystem every agent harness can mount via MCP or REST.",
   mcp: 'POST /mcp (Streamable HTTP, JSON-RPC 2.0) — tools: fs_read, fs_write, fs_append, fs_list, fs_delete',
   rest: 'GET|PUT|DELETE /fs/<path> · GET /ls/<prefix>',
-  auth: 'Authorization: Bearer <token> — the machine key for agents, or a session token from POST /auth/login (POST /auth/signup for a trial account)',
-  conventions: '<name>/... private · shared/... handoffs · system/... machine-owned (read-only to you)',
+  auth: 'Authorization: Bearer <token> (ask Eli)',
+  conventions: '<employee>/... private · shared/... handoffs · system/... machine-owned (read-only to you)',
   heartbeat: 'GET /fs/system/heartbeat.log — one line per hour, written whether or not any PC is awake',
-  ui: 'GET /app (sign in) · GET /app?demo=1 (seeded demo, no account needed)',
-  brains: 'Staff reply on a 3-minute cron when BRAIN_API_KEY and BRAIN_MODEL are set; POST /runner/tick to run one now',
-  source: 'https://github.com/lordbasilaiassistant-sudo/staffroom',
+  queue: 'tasks/messages live on the workspace blackboard: https://cloud.broke2builtai.com (separate tokens)',
 };
 
 const TOOLS = [
-  { name: 'fs_read', description: 'Read a file from the shared computer. Returns text content.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'e.g. ada/notes.md or shared/handoff.json' } }, required: ['path'] } },
-  { name: 'fs_write', description: 'Write/overwrite a file (text). Convention: <name>/... private, shared/... handoffs.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
+  { name: 'fs_read', description: 'Read a file from the shared computer. Returns text content.', inputSchema: { type: 'object', properties: { path: { type: 'string', description: 'e.g. eli/notes.md or shared/handoff.json' } }, required: ['path'] } },
+  { name: 'fs_write', description: 'Write/overwrite a file (text). Convention: <employee>/... private, shared/... handoffs.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
   { name: 'fs_append', description: 'Append a line/chunk to a file (creates it if missing). Good for logs and journals.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } },
   { name: 'fs_list', description: 'List files under a prefix. Returns [{path,size,modified}].', inputSchema: { type: 'object', properties: { prefix: { type: 'string', description: 'e.g. shared/ (empty = everything)' } } } },
   { name: 'fs_delete', description: 'Delete one file.', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } },
@@ -118,7 +106,7 @@ const TOOLS = [
 const cleanPath = (p) => String(p || '').replace(/^\/+/, '').replace(/\.\.+/g, '.').trim();
 const guardWrite = (p) => {
   if (!p) throw { code: -32602, msg: 'path is required' };
-  if (p.startsWith('system/')) throw { code: -32602, msg: 'system/ is machine-owned — write under <name>/ or shared/' };
+  if (p.startsWith('system/')) throw { code: -32602, msg: 'system/ is machine-owned — write under <employee>/ or shared/' };
 };
 
 async function runTool(env, name, args) {
@@ -160,25 +148,45 @@ async function runTool(env, name, args) {
   }
 }
 
-/* Append a message to a staffer's thread, applying CLAIM VERIFICATION.
- *
- * Language models — especially cheap ones — report "done" when the artifact never landed, and a
- * chat transcript full of confident completions is worth nothing on its own. So the platform
- * checks, inside the chat: when a message that is NOT from the owner sounds like completion, find
- * the last work order in the thread that named shared/ paths and verify each of those paths
- * actually changed AFTER that order was posted. The verdict rides along with the message rather
- * than blocking the send, because a rejected agent just retries the same claim in a loop, whereas
- * a visible "unverified" is information for whoever is reading.
- *
- * The sender name is server-decided at the route layer (see /chat/send), so nobody can post as
- * the owner to skip the check. Returns the verify object, or null when there was nothing to check. */
-async function appendToThread(env, who, from, body, tp = '') {
+/* Append a message to an employee's thread, applying MEASURED LAW #1 (bot-seat experiment
+ * 2026-08-14): free models claim "done" while the artifact never landed. When an EMPLOYEE's
+ * message sounds like completion, find the last work order naming shared/ paths and verify each
+ * actually changed AFTER that order. The verdict rides on the message — displayed truth beats
+ * blocked messages (a rejected agent just loops). Returns the verify object (or null). */
+async function appendToThread(env, who, from, body, tp = '', options, actions, report) {
   const key = `${tp}threads/${who}.jsonl`;
   const prev = await env.FS.get(key);
   let lines = prev ? (await prev.text()).split('\n').filter(Boolean) : [];
   const msg = { from, body: String(body).slice(0, 8000), created_at: new Date().toISOString() };
-  const claimsDone = from !== owner(env)
-    && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back)\b/i.test(msg.body);
+  if (Array.isArray(options) && options.length) msg.options = options.slice(0, 4).map((o) => String(o).slice(0, 60));
+  if (report) msg.report = true; // a teammate's work coming home - one round-trip, no echo chains
+  // ACTION LEDGER (2026-08-14, Anthony caught Eli "pretending"): the harness knows which tools a
+  // staffer actually ran. Record them on the message, and stamp claims that outrun the actions —
+  // a model can word a lie, it cannot fake the ledger.
+  if (Array.isArray(actions)) {
+    msg.actions = actions.slice(0, 12);
+    const did = (p) => actions.some((a) => a.startsWith(p));
+    if (/\b(delegat|assign(ed)?\b|handed (it|this|that)? ?(off|to)|coordinating)/i.test(msg.body) && !did('message_teammate')) {
+      msg.verify = { verdict: 'unverified', reason: 'claims delegation, but messaged no teammate' };
+    } else if (/\b(pinged|notified|pushed to (your|the boss)|sent .{0,20}(ping|notification))\b/i.test(msg.body) && !did('notify_boss')) {
+      msg.verify = { verdict: 'unverified', reason: 'claims a notification, but never sent one' };
+    } else if (/\b(open(ed)?|created|set up) .{0,30}(login.?desk|browser session|desk)\b/i.test(msg.body) && !did('login_desk')) {
+      msg.verify = { verdict: 'unverified', reason: 'claims a login desk, but never opened one' };
+    } else if (/\b(wrote|committed|saved|created) .{0,40}shared\//i.test(msg.body) && !did('fs_write') && !did('fs_append')) {
+      msg.verify = { verdict: 'unverified', reason: 'claims a file write, but wrote nothing' };
+    } else if (actions.length === 0 && /\b(web_fetch|web_search|repo_commit|repo_read|api_call|fs_write|fs_append|gmail_unread|calendar_read|yt_recent_comments|yt_reply|wallet_list|wallet_create|wallet_import|browser_visit|login_desk|collect_login|message_teammate|notify_boss|set_routine|hire_staffer)\b/i.test(msg.body)) {
+      // names a tool while the ledger is empty = describing tool output it never produced
+      msg.verify = { verdict: 'unverified', reason: 'names tools it never ran - the ledger is empty' };
+    }
+  }
+  const claimsDone = from !== 'Anthony' && !msg.verify
+    && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back|committed|successful(ly)?|landed|pushed|published|replied to)\b/i.test(msg.body);
+  // a green stamp must be earned by the AUTHOR: files changed by a teammate must never verify
+  // someone else's claim (Gigsby false-green scar, 2026-08-14 - "bad for business")
+  const effectful = /^(fs_write|fs_append|fs_delete|api_call|repo_commit|yt_reply|wallet_create|wallet_import|message_teammate|notify_boss|hire_staffer|set_routine|login_desk|collect_login|browser_visit)/;
+  const authorActed = !Array.isArray(actions) || actions.some((a) => effectful.test(a));
+  // "ran no tools" must mean literally that - a populated ledger with only reads is engagement, not fabrication
+  const ranAnything = !Array.isArray(actions) || actions.length > 0;
   if (claimsDone) {
     const order = [...lines].reverse().map((l) => JSON.parse(l)).find((m) => m.from !== from && /shared\/[\w\/.-]+/.test(m.body));
     if (order) {
@@ -192,8 +200,13 @@ async function appendToThread(env, who, from, body, tp = '') {
         checked.push({ path: p, changed });
       }
       if (checked.length) {
-        msg.verify = { verdict: checked.every((c) => c.changed) ? 'verified' : 'unverified', checked, order_at: order.created_at };
+        msg.verify = !checked.every((c) => c.changed) ? { verdict: 'unverified', checked, order_at: order.created_at }
+          : authorActed ? { verdict: 'verified', checked, order_at: order.created_at }
+          : { verdict: 'unverified', reason: 'files changed, but by a teammate - your own ledger is empty', checked, order_at: order.created_at };
       }
+    }
+    if (!msg.verify && !ranAnything) {
+      msg.verify = { verdict: 'unverified', reason: 'claims completion, but ran no tools' };
     }
   }
   lines.push(JSON.stringify(msg));
@@ -216,7 +229,7 @@ async function handleMcp(req, env) {
       out.push(rpcResult(id, {
         protocolVersion: params?.protocolVersion || '2025-06-18',
         capabilities: { tools: {} },
-        serverInfo: { name: 'staffroom', version: '0.2.0' },
+        serverInfo: { name: 'employee-computer', version: '1.0.0' },
       }));
     } else if (method === 'notifications/initialized') {
       // notification — no response
@@ -240,11 +253,10 @@ async function handleMcp(req, env) {
   return new Response(JSON.stringify(Array.isArray(body) ? out : out[0]), { headers: JSONH });
 }
 
-/* ── ACCOUNTS: email+password login for humans; COMPUTER_TOKEN stays the machine key.
- * users at system/users.json {email:{salt,hash,plan,name,created}}; sessions at
- * system/sessions.json {token:{email,exp}}. Passwords: salted SHA-256, plaintext never stored.
- * Plans: founder-unlimited (root — the owner), trial-1day (24h + a message cap), anything else
- * (a paid tenant; no cap enforced here). */
+/* ── ACCOUNTS (v1.3): email+password login for humans; COMPUTER_TOKEN stays the machine key.
+ * users at system/users.json {email:{salt,hash,plan,name}}; sessions at system/sessions.json
+ * {token:{email,exp}}. Passwords: salted SHA-256, plaintext never stored. Plans: founder-unlimited
+ * (hidden), trial-1day, team-100 — plan strings only for now; enforcement comes with the runner. */
 async function sha256hex(s) {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
   return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -253,34 +265,51 @@ async function readJson(env, key, fallback) {
   const o = await env.FS.get(key);
   return o ? JSON.parse(await o.text()) : fallback;
 }
-/* TENANT ISOLATION. Without it, a fresh trial signup could read the owner's threads AND the whole
- * bucket via /fs. So: the machine key and the founder-unlimited plan resolve to ROOT; every other
- * account maps to tenants/<sha16('tenant:'+email)>/ — a private world with its own staff. The
- * tenant's display name falls back to the email prefix, and gets '.you' appended if it collides
- * with a staffer's name (so claim verification can still tell the boss from the staff). */
+/* TENANCY (QA finding 2026-08-14: a fresh trial signup could read the founder's threads AND the
+ * whole R2 via /fs). Every non-founder account now lives in its own tenants/<id>/ namespace —
+ * own threads, own staff activity, own shared/ workspace. Ops surfaces stay founder+machine only. */
 async function sessionFor(env, auth) {
   if (!auth?.startsWith('Bearer ')) return null;
   const t = auth.slice(7);
-  if (env.COMPUTER_TOKEN && t === env.COMPUTER_TOKEN) return { root: true, name: owner(env), machine: true };
+  if (env.COMPUTER_TOKEN && t === env.COMPUTER_TOKEN) return { root: true, name: 'Anthony', machine: true };
+  // CEO-seat API keys (v1.4): long-lived keys for external harnesses (Claude Code checking on a
+  // company). sk-office-* is hashed at mint time; only the hash is stored, so a leaked registry
+  // reveals nothing. A key inherits exactly its owner's seat — root for the founder office,
+  // the tenant namespace for a customer — never more.
+  if (t.startsWith('sk-office-')) {
+    const reg = await readJson(env, 'system/apikeys.json', {});
+    const rec = reg[await sha256hex(t)];
+    if (!rec) return null;
+    if (rec.email === '__root__') return { root: true, name: rec.label || 'CEO-seat', apikey: true };
+    const users = await readJson(env, 'system/users.json', {});
+    const u = users[rec.email];
+    if (!u) return null;
+    if (u.plan === 'trial-1day' && Date.now() - Date.parse(u.created) > 24 * 3600 * 1000) return null;
+    if (u.plan === 'founder-unlimited') return { root: true, name: rec.label || 'CEO-seat', email: rec.email, plan: u.plan, apikey: true };
+    const tid = (await sha256hex('tenant:' + rec.email)).slice(0, 16);
+    let name = u.name || rec.email.split('@')[0];
+    if (STAFF.some((x) => x.screen_name.toLowerCase() === name.toLowerCase())) name += '.you';
+    return { root: false, tp: `tenants/${tid}/`, tid, name, email: rec.email, plan: u.plan, apikey: true };
+  }
   const sessions = await readJson(env, 'system/sessions.json', {});
   const s = sessions[t];
-  if (!s || !(s.exp > Date.now())) return null;
+  if (!s || s.exp < Date.now()) return null;
   const users = await readJson(env, 'system/users.json', {});
   const rec = users[s.email];
   if (!rec) return null;
   // trial enforcement holds mid-session too, not just at login
   if (rec.plan === 'trial-1day' && Date.now() - Date.parse(rec.created) > 24 * 3600 * 1000) return null;
-  if (rec.plan === 'founder-unlimited') return { root: true, name: owner(env), email: s.email, plan: rec.plan };
+  if (rec.plan === 'founder-unlimited') return { root: true, name: 'Anthony', email: s.email, plan: rec.plan };
   const tid = (await sha256hex('tenant:' + s.email)).slice(0, 16);
   let name = rec.name || s.email.split('@')[0];
-  if (DEFAULT_STAFF.some((x) => x.screen_name.toLowerCase() === name.toLowerCase())) name += '.you'; // never collide with a staffer name
+  if (STAFF.some((x) => x.screen_name.toLowerCase() === name.toLowerCase())) name += '.you'; // never collide with a staffer name
   return { root: false, tp: `tenants/${tid}/`, tid, name, email: s.email, plan: rec.plan };
 }
 
-/* Deps for the runner, scoped to a tenant prefix ('' = the root office).
+/* Deps for the runner, scoped to a tenant prefix ('' = the company's own root office).
  * Tenant staffers read/write ONLY inside tenants/<id>/ — paths are prefixed before they touch R2,
  * and fs_list output has the prefix stripped so the model's world stays consistent. */
-function scopedDeps(tp) {
+function scopedDeps(tp, staff) {
   const rt = async (env2, name, args) => {
     if (!tp) return runTool(env2, name, args);
     const a = { ...(args || {}) };
@@ -292,21 +321,34 @@ function scopedDeps(tp) {
   return {
     runTool: rt,
     postActivity: (env2, body) => postActivity(env2, body, tp),
-    appendToThread: (env2, who, from, body) => appendToThread(env2, who, from, body, tp),
-    staff: DEFAULT_STAFF,
+    appendToThread: (env2, who, from, body, options, actions, report) => appendToThread(env2, who, from, body, tp, options, actions, report),
+    staff: staff || STAFF,
     tp,
+    pending: [], // one-hop teammate wakes queue here; awaited after the sender's own reply posts
+    // agents can grow the team: the lead interviews the boss (ask_user wizard), then hires
+    hireStaffer: async (env2, entry) => {
+      const name = String(entry?.name || '').trim();
+      if (!/^[A-Za-z][A-Za-z0-9_-]{1,19}$/.test(name)) return 'ERROR: name must be 2-20 chars, letters/digits/dash';
+      const bio = String(entry?.bio || '').trim().slice(0, 140);
+      if (!bio) return 'ERROR: bio (their charge) is required';
+      const roster = [...await getStaff(env2, tp)];
+      if (roster.find((s) => s.screen_name.toLowerCase() === name.toLowerCase())) return `ERROR: "${name}" already has a desk`;
+      if (roster.length >= 20) return 'ERROR: office is full (20 desks)';
+      roster.push({ screen_name: name, emoji: String(entry?.emoji || '🤖').slice(0, 4), bio, dept: String(entry?.dept || '').trim().slice(0, 24), spec: String(entry?.spec || '').trim().slice(0, 100) });
+      await env2.FS.put(`${tp}system/staff.json`, JSON.stringify(roster));
+      return `hired ${name} - they have a desk now; the boss can message them from the rail`;
+    },
   };
 }
 
 export default {
   async fetch(req, env, ctx) {
     const u = new URL(req.url);
-    const ownerName = owner(env);
     if (req.method === 'GET' && (u.pathname === '/' || u.pathname === '')) {
       return new Response(JSON.stringify(MANUAL, null, 2), { headers: JSONH });
     }
-    // UI shells are public: the page asks for credentials and every data call it makes is
-    // bearer-gated below, so serving the markup leaks nothing.
+    // The Office viewer — public SHELL only (the page asks for the token and every data call it
+    // makes is bearer-gated above); serving the HTML leaks nothing.
     if (req.method === 'GET' && u.pathname === '/office') {
       return new Response(OFFICE_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
     }
@@ -328,7 +370,7 @@ export default {
       await env.FS.put('system/users.json', JSON.stringify(users));
       return new Response(JSON.stringify({ ok: true, email, plan: 'trial-1day', note: 'trial runs 24h from now' }), { headers: JSONH });
     }
-    // login is the other data route reachable without auth
+    // login is the one route reachable without auth
     if (u.pathname === '/auth/login' && req.method === 'POST') {
       const b = await req.json().catch(() => ({}));
       const email = String(b.email || '').toLowerCase().trim();
@@ -345,9 +387,49 @@ export default {
       for (const [k, v] of Object.entries(sessions)) if (v.exp < Date.now()) delete sessions[k];
       sessions[token] = { email, exp: Date.now() + 30 * 24 * 3600 * 1000 };
       await env.FS.put('system/sessions.json', JSON.stringify(sessions));
-      const out = { ok: true, token, name: rec.plan === 'founder-unlimited' ? ownerName : rec.name, plan: rec.plan };
+      const out = { ok: true, token, name: rec.plan === 'founder-unlimited' ? 'Anthony' : rec.name, plan: rec.plan };
       if (rec.plan === 'trial-1day') out.trial_ends = new Date(Date.parse(rec.created) + 24 * 3600 * 1000).toISOString();
       return new Response(JSON.stringify(out), { headers: JSONH });
+    }
+
+    // ── ONE-CLICK GOOGLE CONNECT. Browser navigations can't carry a bearer header, so /start
+    // takes the session token as ?t= (https, single-use state, 10-min expiry). Read-only scopes.
+    if (u.pathname === '/oauth/google/start' && req.method === 'GET') {
+      const sess0 = await sessionFor(env, 'Bearer ' + (u.searchParams.get('t') || ''));
+      if (!sess0) return err(401, 'sign in first, then click Connect Google again');
+      if (!env.GOOGLE_OAUTH_CLIENT_ID) return err(500, 'Google connect is not configured on this office');
+      const nonce = [...crypto.getRandomValues(new Uint8Array(16))].map((x) => x.toString(16).padStart(2, '0')).join('');
+      await env.FS.put(`system/oauth-state/${nonce}`, JSON.stringify({ acct: sess0.root ? 'root' : sess0.tid, exp: Date.now() + 600000 }));
+      const p = new URLSearchParams({
+        client_id: env.GOOGLE_OAUTH_CLIENT_ID,
+        redirect_uri: 'https://employee-computer.broke2built.workers.dev/oauth/google/callback',
+        response_type: 'code',
+        scope: 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/youtube.force-ssl',
+        access_type: 'offline',
+        prompt: 'consent',
+        state: nonce,
+      });
+      return Response.redirect('https://accounts.google.com/o/oauth2/v2/auth?' + p.toString(), 302);
+    }
+    if (u.pathname === '/oauth/google/callback' && req.method === 'GET') {
+      const code = u.searchParams.get('code');
+      const state = (u.searchParams.get('state') || '').replace(/[^a-f0-9]/g, '');
+      const so = await env.FS.get(`system/oauth-state/${state}`);
+      if (!so || !code) return new Response('That connect link expired - go back to the office and click Connect Google again.', { status: 400 });
+      const st = JSON.parse(await so.text());
+      await env.FS.delete(`system/oauth-state/${state}`);
+      if (st.exp < Date.now()) return new Response('Link expired - try again from the office.', { status: 400 });
+      const tr = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ code, client_id: env.GOOGLE_OAUTH_CLIENT_ID, client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET, redirect_uri: 'https://employee-computer.broke2built.workers.dev/oauth/google/callback', grant_type: 'authorization_code' }),
+      });
+      const td = await tr.json().catch(() => ({}));
+      if (!td.refresh_token && !td.access_token) return new Response('Google did not grant access: ' + JSON.stringify(td).slice(0, 200), { status: 400 });
+      const gKey = `system/google/${st.acct}.json`;
+      const prev = await readJson(env, gKey, {});
+      await env.FS.put(gKey, JSON.stringify({ ...prev, refresh_token: td.refresh_token || prev.refresh_token, connected: new Date().toISOString() }));
+      return new Response('<meta charset="utf-8"><meta http-equiv="refresh" content="1.5;url=/app"><body style="background:#080b10;color:#f2f6fc;font-family:system-ui;display:grid;place-items:center;height:100vh"><div style="text-align:center"><h2>✅ Google connected</h2><p>Your staff can now read your unread mail and calendar.<br>Taking you back to the office… <a href="/app" style="color:#5eead4">or click here</a>.</p></div>', { headers: { 'content-type': 'text/html; charset=utf-8' } });
     }
 
     const auth = req.headers.get('authorization') || '';
@@ -356,14 +438,15 @@ export default {
       return new Response(JSON.stringify({ ok: false, error: 'sign in required' }), { status: 401, headers: JSONH });
     }
     const tp = sess.root ? '' : sess.tp;
-    // tenants get the chat product; the ops surfaces (fs/mcp/runner/feeds) stay root-only
-    if (!sess.root && !(u.pathname.startsWith('/chat/') || (u.pathname.startsWith('/activity/') && req.method === 'GET') || u.pathname.startsWith('/screen/'))) {
+    // tenants get the PRODUCT surfaces (chat, connectors, wallets, routines, activity, screens);
+    // ops surfaces (fs/mcp/runner/register/employees) stay company-internal only
+    if (!sess.root && !(u.pathname.startsWith('/chat/') || u.pathname === '/connectors' || u.pathname === '/wallets' || u.pathname === '/routines' || (u.pathname.startsWith('/activity/') && req.method === 'GET') || u.pathname.startsWith('/screen/'))) {
       return err(403, 'not available on your plan');
     }
 
     // admin-only (machine key): create/replace a user with a hashed password
     if (u.pathname === '/auth/register' && req.method === 'POST') {
-      if (!sess.machine) return err(403, 'machine key required');
+      if (auth !== `Bearer ${env.COMPUTER_TOKEN}`) return err(403, 'machine key required');
       const b = await req.json().catch(() => ({}));
       const email = String(b.email || '').toLowerCase().trim();
       if (!email.includes('@') || !b.password) return err(400, 'need {email, password, plan?, name?}');
@@ -375,11 +458,10 @@ export default {
     }
     if (u.pathname === '/mcp' && req.method === 'POST') return handleMcp(req, env);
 
-    // Manual runner trigger (machine key only) — for testing, and for draining threads on demand
-    // rather than waiting for the next cron tick.
+    // manual runner trigger (machine key only) — testing + on-demand drain
     if (u.pathname === '/runner/tick' && req.method === 'POST') {
-      if (!sess.machine) return err(403, 'machine key required');
-      const results = await runTick(env, scopedDeps(''));
+      if (auth !== `Bearer ${env.COMPUTER_TOKEN}`) return err(403, 'machine key required');
+      const results = await runTick(env, scopedDeps('', await getStaff(env, '')));
       return new Response(JSON.stringify({ ok: true, results }), { headers: JSONH });
     }
 
@@ -397,22 +479,209 @@ export default {
       const lines = obj ? (await obj.text()).split('\n').filter(Boolean) : [];
       return new Response(JSON.stringify({ ok: true, employee: emp, events: lines.slice(-limit).reverse().map((l) => JSON.parse(l)) }), { headers: JSONH });
     }
-
-    // ── CHAT: private team comms, one thread per staffer, stored in this worker's own R2
-    // at threads/<name>.jsonl (tenant-prefixed). A responder drains its thread and appends
-    // replies the same way.
+    // ── CHAT (v1.2 — the faux-Grok-Bot app leg). PRODUCT BOUNDARY (Anthony, 2026-08-14):
+    // AIIM is the PUBLIC network for strangers and their agents — a different product. The
+    // Office's chat is PRIVATE company comms and lives HERE, in this worker's own R2
+    // (threads/<employee>.jsonl). Responders drain their thread and append replies the same way.
     if (u.pathname === '/chat/roster' && req.method === 'GET') {
+      const roster = await getStaff(env, tp);
+      const threads = await env.FS.list({ prefix: `${tp}threads/`, limit: 200 });
+      const threadAt = Object.fromEntries(threads.objects.map((o) => [o.key.slice(`${tp}threads/`.length).replace(/\.jsonl$/, ''), o.uploaded]));
+      const pub = (s) => { const { brain, ...safe } = s; return safe; }; // never ship BYOM keys to the client
+      let agents;
       if (!sess.root) {
         // a tenant's staff are always "at their desks" — they wake the moment you message them
-        return new Response(JSON.stringify({ ok: true, agents: DEFAULT_STAFF.map((s) => ({ ...s, online: true })), owner: ownerName }), { headers: JSONH });
+        agents = roster.map((s) => ({ ...pub(s), online: true, thread_at: threadAt[s.screen_name.toLowerCase()] || null }));
+      } else {
+        const feeds = await env.FS.list({ prefix: 'system-feed/', limit: 200 });
+        const active = Object.fromEntries(feeds.objects.map((o) => [o.key.slice('system-feed/'.length).replace(/\.jsonl$/, ''), o.uploaded]));
+        agents = roster.map((s) => ({ ...pub(s), online: active[s.screen_name.toLowerCase()] ? (Date.now() - new Date(active[s.screen_name.toLowerCase()]) < 600000) : false, thread_at: threadAt[s.screen_name.toLowerCase()] || null }));
+        for (const name of Object.keys(active)) {
+          if (!agents.find((a) => a.screen_name.toLowerCase() === name)) agents.push({ screen_name: name, bio: 'clocked in from the field', emoji: '', online: (Date.now() - new Date(active[name])) < 600000, thread_at: threadAt[name] || null });
+        }
       }
-      const feeds = await env.FS.list({ prefix: 'system-feed/', limit: 200 });
-      const active = Object.fromEntries(feeds.objects.map((o) => [o.key.slice('system-feed/'.length).replace(/\.jsonl$/, ''), o.uploaded]));
-      const agents = DEFAULT_STAFF.map((s) => ({ ...s, online: active[s.screen_name.toLowerCase()] ? (Date.now() - new Date(active[s.screen_name.toLowerCase()]) < 600000) : false }));
-      for (const name of Object.keys(active)) {
-        if (!agents.find((a) => a.screen_name.toLowerCase() === name)) agents.push({ screen_name: name, bio: 'clocked in from the field', emoji: '', online: (Date.now() - new Date(active[name])) < 600000 });
+      return new Response(JSON.stringify({ ok: true, agents }), { headers: JSONH });
+    }
+    // create / remove a staffer (feature: agents are easy to make). BYOM fields optional.
+    if (u.pathname === '/chat/staff' && req.method === 'POST') {
+      const b = await req.json().catch(() => ({}));
+      const name = String(b.screen_name || '').trim();
+      if (!/^[A-Za-z][A-Za-z0-9_-]{1,19}$/.test(name)) return err(400, 'name: 2-20 chars, letters/digits/dash, starts with a letter');
+      const bio = String(b.bio || '').trim().slice(0, 140);
+      if (!bio) return err(400, 'give them a charge: what is this staffer for?');
+      const roster = [...await getStaff(env, tp)];
+      if (roster.find((s) => s.screen_name.toLowerCase() === name.toLowerCase())) return err(409, 'a staffer with that name already exists');
+      if (roster.length >= 20) return err(400, 'office is full (20 desks) - remove someone first');
+      const entry = { screen_name: name, emoji: String(b.emoji || '🤖').slice(0, 4), bio, dept: String(b.dept || '').trim().slice(0, 24), spec: String(b.spec || '').trim().slice(0, 100) };
+      if (b.brain_url || b.brain_model || b.brain_key) {
+        if (b.brain_url && !/^https:\/\//.test(String(b.brain_url))) return err(400, 'brain endpoint must be https');
+        entry.brain = { url: String(b.brain_url || '').slice(0, 300), model: String(b.brain_model || '').slice(0, 80), key: String(b.brain_key || '').slice(0, 300) };
       }
-      return new Response(JSON.stringify({ ok: true, agents, owner: ownerName }), { headers: JSONH });
+      roster.push(entry);
+      await env.FS.put(`${tp}system/staff.json`, JSON.stringify(roster));
+      return new Response(JSON.stringify({ ok: true, screen_name: name }), { headers: JSONH });
+    }
+    // edit a staffer (name/emoji/bio/brain) — renames migrate the thread so history survives
+    if (u.pathname === '/chat/staff' && req.method === 'PUT') {
+      const b = await req.json().catch(() => ({}));
+      const roster = [...await getStaff(env, tp)];
+      const i = roster.findIndex((s) => s.screen_name.toLowerCase() === String(b.screen_name || '').toLowerCase());
+      if (i < 0) return err(404, 'no staffer by that name');
+      const s = { ...roster[i] };
+      if (b.new_name && b.new_name !== s.screen_name) {
+        if (!/^[A-Za-z][A-Za-z0-9_-]{1,19}$/.test(b.new_name)) return err(400, 'new name: 2-20 chars, letters/digits/dash');
+        if (roster.find((x) => x.screen_name.toLowerCase() === b.new_name.toLowerCase())) return err(409, 'that name is taken');
+        const oldKey = `${tp}threads/${s.screen_name.toLowerCase()}.jsonl`;
+        const obj = await env.FS.get(oldKey);
+        if (obj) { await env.FS.put(`${tp}threads/${String(b.new_name).toLowerCase()}.jsonl`, await obj.text()); await env.FS.delete(oldKey); }
+        s.screen_name = String(b.new_name);
+      }
+      if ('emoji' in b) s.emoji = String(b.emoji || '🤖').slice(0, 4);
+      if ('bio' in b) { const bio = String(b.bio || '').trim().slice(0, 140); if (!bio) return err(400, 'bio cannot be empty'); s.bio = bio; }
+      if ('dept' in b) s.dept = String(b.dept || '').trim().slice(0, 24);
+      if ('spec' in b) s.spec = String(b.spec || '').trim().slice(0, 100);
+      if (b.brain_url || b.brain_model || b.brain_key) {
+        if (b.brain_url && !/^https:\/\//.test(String(b.brain_url))) return err(400, 'brain endpoint must be https');
+        s.brain = { url: String(b.brain_url || '').slice(0, 300), model: String(b.brain_model || '').slice(0, 80), key: String(b.brain_key || s.brain?.key || '').slice(0, 300) };
+      } else if (b.brain_clear) delete s.brain;
+      roster[i] = s;
+      await env.FS.put(`${tp}system/staff.json`, JSON.stringify(roster));
+      return new Response(JSON.stringify({ ok: true, screen_name: s.screen_name }), { headers: JSONH });
+    }
+    if (u.pathname === '/chat/staff' && req.method === 'DELETE') {
+      const name = String(u.searchParams.get('name') || '').toLowerCase();
+      if (STAFF.some((s) => s.screen_name.toLowerCase() === name)) return err(400, 'the default staff keep their desks');
+      const roster = (await getStaff(env, tp)).filter((s) => s.screen_name.toLowerCase() !== name);
+      await env.FS.put(`${tp}system/staff.json`, JSON.stringify(roster));
+      return new Response(JSON.stringify({ ok: true }), { headers: JSONH });
+    }
+    // CEO-seat API keys: mint/list/revoke. Keys let an external harness (Claude Code) sit in the
+    // owner's seat — read the roster, threads, routines, stats; send orders. An API key cannot mint
+    // more keys (no self-replication); minting takes a human session or the machine key.
+    if (u.pathname === '/apikeys' && req.method === 'POST') {
+      if (sess.apikey) return err(403, 'an API key cannot mint API keys - sign in to do that');
+      const b = await req.json().catch(() => ({}));
+      const label = String(b.label || 'ceo-seat').trim().slice(0, 40) || 'ceo-seat';
+      const owner = sess.machine ? '__root__' : (sess.email || '__root__');
+      const reg = await readJson(env, 'system/apikeys.json', {});
+      if (Object.values(reg).filter((r) => r.email === owner).length >= 5) return err(400, 'key limit (5) - revoke one first');
+      const raw = 'sk-office-' + [...crypto.getRandomValues(new Uint8Array(24))].map((x) => x.toString(16).padStart(2, '0')).join('');
+      reg[await sha256hex(raw)] = { email: owner, label, created: new Date().toISOString(), last4: raw.slice(-4) };
+      await env.FS.put('system/apikeys.json', JSON.stringify(reg));
+      return new Response(JSON.stringify({ ok: true, key: raw, label, note: 'shown once - store it now' }), { headers: JSONH });
+    }
+    if (u.pathname === '/apikeys' && req.method === 'GET') {
+      const owner = sess.machine || sess.root && !sess.email ? '__root__' : sess.email;
+      const reg = await readJson(env, 'system/apikeys.json', {});
+      const mine = Object.entries(reg).filter(([, r]) => r.email === owner || (sess.machine && true)).map(([h, r]) => ({ id: h.slice(0, 12), email: r.email, label: r.label, created: r.created, last4: r.last4 }));
+      return new Response(JSON.stringify({ ok: true, keys: mine }), { headers: JSONH });
+    }
+    if (u.pathname === '/apikeys' && req.method === 'DELETE') {
+      if (sess.apikey) return err(403, 'an API key cannot revoke keys - sign in to do that');
+      const id = String(u.searchParams.get('id') || '');
+      const owner = sess.machine ? null : sess.email; // machine may revoke any; a user only their own
+      const reg = await readJson(env, 'system/apikeys.json', {});
+      const h = Object.keys(reg).find((k) => k.startsWith(id) && id.length >= 8 && (!owner || reg[k].email === owner));
+      if (!h) return err(404, 'no key matching that id');
+      delete reg[h];
+      await env.FS.put('system/apikeys.json', JSON.stringify(reg));
+      return new Response(JSON.stringify({ ok: true }), { headers: JSONH });
+    }
+    // team stats: the harness's scorecard view (same numbers the Sunday review reads)
+    if (u.pathname === '/chat/stats' && req.method === 'GET') {
+      return new Response(JSON.stringify({ ok: true, stats: await teamStats(env, tp) }), { headers: JSONH });
+    }
+    // connectors: the user's own feeds/pings, stored ROOT-side (never readable via staffer fs tools)
+    if (u.pathname === '/connectors' && req.method === 'GET') {
+      const google = !!(await env.FS.get(`system/google/${sess.root ? 'root' : sess.tid}.json`));
+      return new Response(JSON.stringify({ ok: true, connectors: await readJson(env, connKey(sess), {}), google }), { headers: JSONH });
+    }
+    if (u.pathname === '/connectors' && req.method === 'POST') {
+      const b = await req.json().catch(() => ({}));
+      const cur = await readJson(env, connKey(sess), {});
+      for (const [k, re] of [['ics_url', /^https?:\/\/.+/], ['rss_url', /^https?:\/\/.+/], ['ntfy_topic', /^[A-Za-z0-9_-]{4,64}$/], ['bankr_api_key', /^[\x21-\x7e]{8,120}$/]]) {
+        if (k in b) {
+          const v = String(b[k] || '').trim();
+          if (!v) delete cur[k];
+          else if (!re.test(v)) return err(400, `${k} looks invalid`);
+          else cur[k] = v.slice(0, 500);
+        }
+      }
+      if ('custom' in b) {
+        if (!Array.isArray(b.custom) || b.custom.length > 8) return err(400, 'custom: up to 8 services');
+        const clean = [];
+        for (const c of b.custom) {
+          const name = String(c?.name || '').trim();
+          const base = String(c?.base || '').trim();
+          if (!/^[A-Za-z0-9_-]{2,20}$/.test(name)) return err(400, `service name "${name}" invalid (2-20 chars)`);
+          if (!/^https:\/\/.+/.test(base)) return err(400, `service "${name}": base must be https`);
+          clean.push({ name, base: base.slice(0, 200), headerName: String(c?.headerName || 'authorization').slice(0, 40), headerValue: String(c?.headerValue || '').slice(0, 500) });
+        }
+        cur.custom = clean;
+      }
+      await env.FS.put(connKey(sess), JSON.stringify(cur));
+      return new Response(JSON.stringify({ ok: true, connectors: cur }), { headers: JSONH });
+    }
+    // routines: standing orders that fire on the hourly cron ("every morning, brief me")
+    if (u.pathname === '/routines' && req.method === 'GET') {
+      return new Response(JSON.stringify({ ok: true, routines: await readJson(env, routKey(sess), []) }), { headers: JSONH });
+    }
+    if (u.pathname === '/routines' && req.method === 'POST') {
+      const b = await req.json().catch(() => ({}));
+      const staffer = String(b.staffer || '').trim();
+      const text = String(b.text || '').trim().slice(0, 1500);
+      const every = Number(b.every_hours) || 0;
+      const hour = Number(b.hourUTC);
+      if (!staffer || !text || (!every && !(hour >= 0 && hour <= 23))) return err(400, 'need {staffer, text, hourUTC 0-23} or {every_hours 2-12}');
+      if (every && !(every >= 2 && every <= 12)) return err(400, 'every_hours must be 2-12');
+      if (!(await getStaff(env, tp)).find((s) => s.screen_name.toLowerCase() === staffer.toLowerCase())) return err(400, 'no staffer by that name');
+      const list = await readJson(env, routKey(sess), []);
+      const cap = sess.root ? 40 : sess.plan === 'trial-1day' ? 3 : 10;
+      if (list.length >= cap) return err(400, `routine limit (${cap}) reached`);
+      list.push({ id: Date.now().toString(36), staffer, text, hourUTC: every ? 0 : hour, ...(every ? { everyHours: every } : {}), from: sess.name, tp, lastRun: '' });
+      await env.FS.put(routKey(sess), JSON.stringify(list));
+      return new Response(JSON.stringify({ ok: true, routines: list }), { headers: JSONH });
+    }
+    if (u.pathname === '/routines' && req.method === 'PUT') {
+      const b = await req.json().catch(() => ({}));
+      const list = await readJson(env, routKey(sess), []);
+      const r = list.find((x) => x.id === b.id);
+      if (!r) return err(404, 'no routine with that id');
+      if (b.staffer) r.staffer = String(b.staffer);
+      if (b.text) r.text = String(b.text).trim().slice(0, 1500);
+      if (b.hourUTC !== undefined) { const h = Number(b.hourUTC); if (!(h >= 0 && h <= 23)) return err(400, 'hourUTC 0-23'); r.hourUTC = h; }
+      await env.FS.put(routKey(sess), JSON.stringify(list));
+      return new Response(JSON.stringify({ ok: true, routines: list }), { headers: JSONH });
+    }
+    if (u.pathname === '/routines' && req.method === 'DELETE') {
+      const id = u.searchParams.get('id') || '';
+      const list = (await readJson(env, routKey(sess), [])).filter((r) => r.id !== id);
+      await env.FS.put(routKey(sess), JSON.stringify(list));
+      return new Response(JSON.stringify({ ok: true, routines: list }), { headers: JSONH });
+    }
+    // wallets: watch-only surface for the UI (create/import/list — moving funds has NO route here)
+    if (u.pathname === '/wallets' && req.method === 'GET') {
+      return new Response(JSON.stringify({ ok: true, wallets: await walletRows(env, tp) }), { headers: JSONH });
+    }
+    if (u.pathname === '/wallets' && req.method === 'POST') {
+      const b = await req.json().catch(() => ({}));
+      const out = b.action === 'import'
+        ? await walletImport(env, tp, b.name, b.private_key)
+        : await walletCreate(env, tp, b.name);
+      if (String(out).startsWith('ERROR')) return err(400, String(out).slice(7));
+      return new Response(JSON.stringify({ ok: true, msg: out }), { headers: JSONH });
+    }
+    // the user's window into what their staff produce
+    if (u.pathname === '/chat/files' && req.method === 'GET') {
+      const list = await env.FS.list({ prefix: `${tp}shared/`, limit: 200 });
+      return new Response(JSON.stringify({ ok: true, files: list.objects.map((o) => ({ path: o.key.slice(tp.length), size: o.size, modified: o.uploaded })) }), { headers: JSONH });
+    }
+    if (u.pathname === '/chat/file' && req.method === 'GET') {
+      const p = cleanPath(u.searchParams.get('path'));
+      if (!p.startsWith('shared/')) return err(400, 'only shared/ files are viewable here');
+      const obj = await env.FS.get(tp + p);
+      if (!obj) return err(404, 'no such file');
+      return new Response((await obj.text()).slice(0, 200000), { headers: { 'content-type': 'text/plain; charset=utf-8' } });
     }
     if (u.pathname.startsWith('/chat/thread/') && req.method === 'GET') {
       const who = (u.pathname.split('/')[3] || '').replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
@@ -426,13 +695,11 @@ export default {
     if (u.pathname === '/chat/send' && req.method === 'POST') {
       const b = await req.json().catch(() => ({}));
       const who = String(b.to || '').replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase();
-      // the server decides the sender: machine/owner may pass from; a tenant is always themselves
-      const from = sess.root ? String(b.from || ownerName).slice(0, 40) : sess.name.slice(0, 40);
-      if (!who || !b.body) return err(400, 'need {to, body} (agents also pass their own "from")');
-      // trial cost cap (model calls are metered kindness, not infinite)
+      // the server decides the sender: machine/founder may pass from; a tenant is always themselves
+      const from = sess.root ? String(b.from || 'Anthony').slice(0, 40) : sess.name.slice(0, 40);
+      if (!who || !b.body) return err(400, 'need {to, body} (and employees pass their own "from")');
+      // trial cost cap (free-brain calls are metered kindness, not infinite)
       if (!sess.root && sess.plan === 'trial-1day') {
-        // ROOT-namespace usage file, on purpose: a tenant's staffers write only under tenants/<id>/,
-        // so nothing inside the tenant's world can reset its own meter.
         const uKey = `system/tenant-usage/${sess.tid}.json`;
         const usage = await readJson(env, uKey, { sends: 0 });
         if (usage.sends >= 40) return err(429, 'trial message limit reached (40) - upgrade to keep your staff working');
@@ -440,20 +707,21 @@ export default {
         await env.FS.put(uKey, JSON.stringify(usage));
       }
       const verify = await appendToThread(env, who, from, b.body, tp);
-      // WAKE-ON-SEND: a human message to a staffer triggers an immediate runner pass in the
-      // background — replies in seconds instead of "sometime this cron". The */3 cron stays as
-      // the sweeper for the root office; tenant threads answer on wake only.
-      if (sess.root ? from === ownerName : true) {
-        const staffer = DEFAULT_STAFF.find((s) => s.screen_name.toLowerCase() === who);
-        if (staffer) ctx.waitUntil(import('./runner.mjs').then((m) => m.respondForStaffer(env, scopedDeps(tp), staffer)).catch(() => {}));
+      // WAKE-ON-SEND (Anthony 2026-08-14: "wait times tell the user nothing"): a human message to
+      // a staffer triggers an immediate runner pass in the background - replies in seconds. The
+      // */3 cron stays as the sweeper for the root office; tenant threads answer on wake only.
+      if (sess.root ? from === 'Anthony' : true) {
+        const roster = await getStaff(env, tp);
+        const staffer = roster.find((s) => s.screen_name.toLowerCase() === who);
+        if (staffer) ctx.waitUntil(respondForStaffer(env, scopedDeps(tp, roster), staffer).catch(() => {}));
       }
-      return new Response(JSON.stringify({ ok: true, from, verify }), { headers: JSONH });
+      return new Response(JSON.stringify({ ok: true, verify }), { headers: JSONH });
     }
 
     if (u.pathname === '/employees' && req.method === 'GET') {
       const feeds = await env.FS.list({ prefix: 'system-feed/', limit: 200 });
       const emps = feeds.objects.map((o) => ({ name: o.key.slice('system-feed/'.length).replace(/\.jsonl$/, ''), lastActive: o.uploaded }));
-      return new Response(JSON.stringify({ ok: true, employees: emps, owner: ownerName }), { headers: JSONH });
+      return new Response(JSON.stringify({ ok: true, employees: emps }), { headers: JSONH });
     }
     if (u.pathname.startsWith('/screen/') && req.method === 'GET') {
       const emp = u.pathname.split('/')[2]?.replace(/[^a-zA-Z0-9_-]/g, '') || '';
@@ -497,13 +765,13 @@ export default {
   },
 
   async scheduled(event, env) {
-    // Frequent cron: the staff answer their threads (root office only — tenant threads answer on
-    // wake-on-send). Wrapped in try/catch because a brain outage must not take the heartbeat down.
-    if (event.cron === RUNNER_CRON) {
-      try { await runTick(env, scopedDeps('')); } catch {}
+    // */3 cron = the staff answer their threads (free-model brains, proof-stamped).
+    if (event.cron === '*/3 * * * *') {
+      try { await runTick(env, scopedDeps('', await getStaff(env, ''))); } catch {}
+      try { await auditTick(env, '', scopedDeps('', await getStaff(env, ''))); } catch {} // Auditor sweeps + bounces suspects back for retry
       return;
     }
-    // Hourly cron: the proof that the computer outlives your laptop — one line per hour, from the edge.
+    // hourly cron = the PC-off proof: one line per hour, written by the edge, no PC involved.
     const key = 'system/heartbeat.log';
     const prev = await env.FS.get(key);
     let text = prev ? await prev.text() : '';
@@ -511,5 +779,34 @@ export default {
     const lines = text.split('\n').filter(Boolean);
     if (lines.length > 2000) text = lines.slice(-2000).join('\n') + '\n';
     await env.FS.put(key, text + new Date().toISOString() + ' alive\n');
+
+    // routines sweep: standing orders land in the staffer's thread as the boss, then the staffer
+    // works them through the normal wake + verification pipeline. Once per routine per UTC day.
+    try {
+      const hour = new Date().getUTCHours();
+      const today = new Date().toISOString().slice(0, 10);
+      const files = await env.FS.list({ prefix: 'system/routines/', limit: 100 });
+      for (const f of files.objects) {
+        try {
+          const list = JSON.parse(await (await env.FS.get(f.key)).text());
+          let dirty = false;
+          for (const r of list) {
+            const stamp = r.everyHours ? `${today}#${hour}` : today;
+            const due = r.everyHours ? (hour % r.everyHours === 0 && r.lastRun !== stamp) : (r.hourUTC === hour && r.lastRun !== stamp);
+            if (due) {
+              r.lastRun = stamp; dirty = true;
+              const tp2 = r.tp || '';
+              const staff = await getStaff(env, tp2);
+              const st = staff.find((s) => s.screen_name.toLowerCase() === String(r.staffer).toLowerCase());
+              if (st) {
+                await appendToThread(env, st.screen_name.toLowerCase(), r.from || 'Anthony', `[Routine] ${r.text}`, tp2);
+                await respondForStaffer(env, scopedDeps(tp2, staff), st).catch(() => {});
+              }
+            }
+          }
+          if (dirty) await env.FS.put(f.key, JSON.stringify(list));
+        } catch {}
+      }
+    } catch {}
   },
 };
