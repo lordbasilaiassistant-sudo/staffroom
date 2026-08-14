@@ -370,6 +370,29 @@ export default {
       await env.FS.put('system/users.json', JSON.stringify(users));
       return new Response(JSON.stringify({ ok: true, email, plan: 'trial-1day', note: 'trial runs 24h from now' }), { headers: JSONH });
     }
+    // EVENT TRIGGERS (2026-08-14, from the Grok Bot teardown — schedule OR event): an external
+    // service POSTs here and the named staffer wakes within seconds, same path as a human message.
+    // The URL token is the only credential and only its hash is stored; wake is throttled to one
+    // per 30s per hook (spam still lands in the thread — the cron sweeper reads it in batch).
+    if (u.pathname.startsWith('/hook/') && req.method === 'POST') {
+      const tok = u.pathname.slice(6).replace(/[^a-f0-9]/g, '');
+      const reg = await readJson(env, 'system/hooks.json', {});
+      const h = reg[await sha256hex('hook:' + tok)];
+      if (!h) return err(404, 'no such hook');
+      const raw = (await req.text().catch(() => '')).slice(0, 4000);
+      let pretty = raw;
+      try { pretty = JSON.stringify(JSON.parse(raw), null, 1).slice(0, 2000); } catch {}
+      const recentWake = h.last && Date.now() - Date.parse(h.last) < 30000;
+      await appendToThread(env, h.staffer.toLowerCase(), 'Webhook', `[event: ${h.label}] ${pretty || '(empty payload)'}\n\nHandle this per your specialization; if it is not your lane, message_teammate the right desk and say why.`, h.tp);
+      h.fired = (h.fired || 0) + 1; h.last = new Date().toISOString();
+      await env.FS.put('system/hooks.json', JSON.stringify(reg));
+      if (!recentWake) {
+        const roster = await getStaff(env, h.tp);
+        const staffer = roster.find((s) => s.screen_name.toLowerCase() === h.staffer.toLowerCase());
+        if (staffer) ctx.waitUntil(respondForStaffer(env, scopedDeps(h.tp, roster), staffer).catch(() => {}));
+      }
+      return new Response(JSON.stringify({ ok: true }), { headers: JSONH });
+    }
     // login is the one route reachable without auth
     if (u.pathname === '/auth/login' && req.method === 'POST') {
       const b = await req.json().catch(() => ({}));
@@ -440,7 +463,7 @@ export default {
     const tp = sess.root ? '' : sess.tp;
     // tenants get the PRODUCT surfaces (chat, connectors, wallets, routines, activity, screens);
     // ops surfaces (fs/mcp/runner/register/employees) stay company-internal only
-    if (!sess.root && !(u.pathname.startsWith('/chat/') || u.pathname === '/connectors' || u.pathname === '/wallets' || u.pathname === '/routines' || (u.pathname.startsWith('/activity/') && req.method === 'GET') || u.pathname.startsWith('/screen/'))) {
+    if (!sess.root && !(u.pathname.startsWith('/chat/') || u.pathname === '/connectors' || u.pathname === '/wallets' || u.pathname === '/routines' || u.pathname === '/hooks' || u.pathname === '/apikeys' || (u.pathname.startsWith('/activity/') && req.method === 'GET') || u.pathname.startsWith('/screen/'))) {
       return err(403, 'not available on your plan');
     }
 
@@ -585,6 +608,36 @@ export default {
       if (!h) return err(404, 'no key matching that id');
       delete reg[h];
       await env.FS.put('system/apikeys.json', JSON.stringify(reg));
+      return new Response(JSON.stringify({ ok: true }), { headers: JSONH });
+    }
+    // event-trigger hooks: mint/list/revoke. The fire route lives up top, unauthenticated by URL token.
+    if (u.pathname === '/hooks' && req.method === 'POST') {
+      const b = await req.json().catch(() => ({}));
+      const staffer = String(b.staffer || '').trim();
+      if (!(await getStaff(env, tp)).find((s) => s.screen_name.toLowerCase() === staffer.toLowerCase())) return err(400, 'no staffer by that name');
+      const label = String(b.label || 'event').trim().slice(0, 60) || 'event';
+      const reg = await readJson(env, 'system/hooks.json', {});
+      const owner = sess.root ? '__root__' : sess.tid;
+      if (Object.values(reg).filter((r) => r.owner === owner).length >= 12) return err(400, 'hook limit (12) - revoke one first');
+      const raw = [...crypto.getRandomValues(new Uint8Array(20))].map((x) => x.toString(16).padStart(2, '0')).join('');
+      reg[await sha256hex('hook:' + raw)] = { owner, tp, staffer, label, created: new Date().toISOString() };
+      await env.FS.put('system/hooks.json', JSON.stringify(reg));
+      return new Response(JSON.stringify({ ok: true, url: `${u.origin}/hook/${raw}`, label, staffer, note: 'shown once - store it now' }), { headers: JSONH });
+    }
+    if (u.pathname === '/hooks' && req.method === 'GET') {
+      const owner = sess.root ? '__root__' : sess.tid;
+      const reg = await readJson(env, 'system/hooks.json', {});
+      const mine = Object.entries(reg).filter(([, r]) => r.owner === owner).map(([h, r]) => ({ id: h.slice(0, 12), staffer: r.staffer, label: r.label, created: r.created, fired: r.fired || 0, last: r.last || null }));
+      return new Response(JSON.stringify({ ok: true, hooks: mine }), { headers: JSONH });
+    }
+    if (u.pathname === '/hooks' && req.method === 'DELETE') {
+      const id = String(u.searchParams.get('id') || '');
+      const owner = sess.root ? '__root__' : sess.tid;
+      const reg = await readJson(env, 'system/hooks.json', {});
+      const h = Object.keys(reg).find((k) => k.startsWith(id) && id.length >= 8 && reg[k].owner === owner);
+      if (!h) return err(404, 'no hook matching that id');
+      delete reg[h];
+      await env.FS.put('system/hooks.json', JSON.stringify(reg));
       return new Response(JSON.stringify({ ok: true }), { headers: JSONH });
     }
     // team stats: the harness's scorecard view (same numbers the Sunday review reads)
