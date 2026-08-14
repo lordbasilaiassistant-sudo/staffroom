@@ -64,7 +64,7 @@ function gate(){app.innerHTML='<div id="gate"><div class="card"><b>Staffroom key
 async function api(p){const r=await fetch(p,{headers:{authorization:'Bearer '+tok()}});if(r.status===401){gate();throw 0}return r;}
 function ago(t){const s=(Date.now()-new Date(t))/1e3;if(s<90)return Math.round(s)+'s ago';if(s<5400)return Math.round(s/60)+'m ago';if(s<172800)return Math.round(s/3600)+'h ago';return Math.round(s/86400)+'d ago';}
 async function boot(){if(!tok())return gate();
-app.innerHTML='<main><nav id="roster"><h2>Staff</h2><div id="list"></div></nav><section id="stage"><div class="placeholder">Pick a teammate to open their screen.<br><br>They post what they are doing as they work;<br>browser-driving teammates attach live screenshots.</div></section></main>';
+app.innerHTML='<main><nav id="roster"><h2>Staff</h2><div id="list"></div></nav><section id="stage"><div class="placeholder">Pick a staffer to open their screen.<br><br>They post what they are doing as they work;<br>browser-driving staffers attach live screenshots.</div></section></main>';
 await roster();}
 async function roster(){try{const d=await(await api('/employees')).json();
 const list=document.getElementById('list');if(!list)return;
@@ -74,7 +74,7 @@ async function pick(n){sel=n;clearInterval(timer);await render();timer=setInterv
 async function render(){if(!sel)return;const st=document.getElementById('stage');if(!st)return;
 let ev=[];try{ev=(await(await api('/activity/'+sel)).json()).events||[]}catch(e){}
 const shot=await fetch('/screen/'+sel,{headers:{authorization:'Bearer '+tok()}});
-const screen=shot.ok?'<img src="data:image/png;base64,'+btoa(String.fromCharCode(...new Uint8Array(await shot.arrayBuffer())))+'">':'<div class="noscreen">No screen frames yet — this teammate works headless. The action feed below is their monitor.</div>';
+const screen=shot.ok?'<img src="data:image/png;base64,'+btoa(String.fromCharCode(...new Uint8Array(await shot.arrayBuffer())))+'">':'<div class="noscreen">No screen frames yet — this staffer works headless. The action feed below is their monitor.</div>';
 st.innerHTML='<div class="screenwrap"><div class="bar"><i></i><i></i><i></i><span style="margin-left:auto" class="live">● LIVE · '+sel.toUpperCase()+"'S SCREEN</span></div>"+screen+'</div><div class="feed"><h3>What they are doing</h3>'+(ev.map(e=>'<div class="ev"><div class="tick"></div><div><div class="action">'+esc(e.action)+'</div>'+(e.detail?'<div class="detail">'+esc(e.detail)+'</div>':'')+'<div class="t">'+new Date(e.t).toLocaleString()+'</div></div></div>').join('')||'<div style="color:var(--dim)">No events yet.</div>')+'</div>';}
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 window.pick=pick;window.boot=boot;boot();

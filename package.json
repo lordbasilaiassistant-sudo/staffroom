@@ -1,7 +1,7 @@
 {
   "name": "staffroom",
   "version": "0.1.0",
-  "description": "Open-source AI staff — persistent AI teammates with their own always-on computer, watchable screens, team chat, and built-in claim verification.",
+  "description": "Open-source AI staff — a team of persistent AI staffers with their own always-on computer, watchable screens, team chat, and built-in claim verification.",
   "private": false,
   "license": "MIT",
   "type": "module",

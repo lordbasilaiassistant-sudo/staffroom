@@ -1,4 +1,4 @@
-/* Staffroom app — the desk view. Three panes: staff | private chat | that member's computer
+/* Staffroom app — the desk view. Three panes: staff | private chat | that staffer's computer
  * (live screen + activity feed). Served at GET /app; client logic at GET /app.js as a real JS
  * file rather than an inline <script> — inline scripts inside a template literal need double
  * escaping, which broke the page silently the first time round.
@@ -91,8 +91,8 @@ color:var(--dim);cursor:pointer;display:grid;place-items:center;font-size:15px;b
 ::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:var(--line);border-radius:9px}
 </style></head><body>
 <div id="shell">
-<nav id="rail"><div class="brand"><div class="logo"></div><div><b>Staffroom</b><span>your AI teammates, always on</span></div><span id="demobadge">DEMO</span></div><div id="emps"></div></nav>
-<section id="chat"><div id="empty">Pick a teammate.<br><br>They answer here, and their computer<br>opens on the right so you can watch them work.</div></section>
+<nav id="rail"><div class="brand"><div class="logo"></div><div><b>Staffroom</b><span>your AI staff, always on</span></div><span id="demobadge">DEMO</span></div><div id="emps"></div></nav>
+<section id="chat"><div id="empty">Pick a staffer.<br><br>They answer here, and their computer<br>opens on the right so you can watch them work.</div></section>
 <aside id="pc"></aside>
 </div>
 <div id="gate"><div class="card"><b>Sign in to the staffroom</b><div style="color:var(--dim);font-size:13px;margin-top:6px" id="gerr">Your team is already at their desks.</div><input id="em" type="email" placeholder="email" autocomplete="username"><input id="tk" type="password" placeholder="password" autocomplete="current-password"><button id="gbtn">Clock in</button><div class="demo"><a href="?demo=1">or walk through the demo staffroom &rarr;</a></div></div></div>
@@ -209,7 +209,7 @@ async function renderPC(){
   }catch(e){}}
  $('pc').innerHTML='<h4>'+esc(sel||'')+String.fromCharCode(39)+'s computer</h4>'
   +'<div class="monitor'+(img?' shimmer':'')+'"><div class="bar"><i></i><i></i><i></i><span class="live">'+(img?'● LIVE':'HEADLESS')+'</span></div>'
-  +(img||'<div class="off">No screen frames - this teammate works headless right now. The feed below is their monitor.</div>')+'</div>'
+  +(img||'<div class="off">No screen frames - this staffer works headless right now. The feed below is their monitor.</div>')+'</div>'
   +'<h4>What they'+String.fromCharCode(39)+'re doing</h4>'
   +((evs||[]).map(e=>'<div class="ev"><b>'+esc(e.action)+'</b>'+(e.detail?'<div class="d">'+esc(e.detail)+'</div>':'')+'<div class="t">'+ago(e.t)+' ago</div></div>').join('')||'<div class="ev" style="color:var(--dim)">Nothing logged yet.</div>');}
 

@@ -9,7 +9,7 @@
  *   POST /mcp        — MCP Streamable HTTP (JSON-RPC 2.0): initialize, tools/list, tools/call.
  *                      Tools: fs_read, fs_write, fs_append, fs_list, fs_delete.
  *   REST mirror      — GET/PUT/DELETE /fs/<path> · GET /ls/<prefix> (same auth; for curl/scripts).
- *   POST /activity   — a staff member broadcasts what it is doing (+ an optional screenshot).
+ *   POST /activity   — a staffer broadcasts what it is doing (+ an optional screenshot).
  *   GET  /activity/<name> · GET /screen/<name> · GET /employees — the watch surfaces.
  *   GET  /chat/roster · /chat/thread/<name> · POST /chat/send   — private team chat.
  *   POST /runner/tick — make the staff answer their threads now (machine key only).
@@ -20,7 +20,7 @@
  * AUTH: Authorization: Bearer <token>, where the token is either COMPUTER_TOKEN (the machine key
  * your agents carry) or a session token from POST /auth/login (humans). Public: GET / and the
  * UI shell — every data call the page makes is bearer-gated.
- * NAMESPACING: paths are free-form; convention is <name>/... for a member's private work and
+ * NAMESPACING: paths are free-form; convention is <name>/... for a staffer's private work and
  * shared/... for handoffs. system/ is the worker's own — writes there are refused.
  *
  * Fail-soft: bad input = 4xx with a message naming the fix; JSON-RPC errors use code -32602.
@@ -35,11 +35,11 @@ const JSONH = { 'content-type': 'application/json; charset=utf-8' };
 const err = (status, message) => new Response(JSON.stringify({ ok: false, error: message }), { status, headers: JSONH });
 const MAX_BYTES = 25 * 1024 * 1024;
 
-/* ACTIVITY FEED — every staff member can broadcast what it is doing, and the UI renders that
+/* ACTIVITY FEED — every staffer can broadcast what it is doing, and the UI renders that
  * stream as "their screen":
  *   POST /activity  {employee, action, detail?, screenshot_b64?}  — appends an event; if a
  *     screenshot (png/jpeg base64) is attached it is stored at screens/<employee>/latest.png
- *     (overwritten each time = that member's live monitor) and the event notes it.
+ *     (overwritten each time = that staffer's live monitor) and the event notes it.
  *   GET  /activity/<employee>?limit=50 — newest-first event log (JSON).
  *   GET  /screen/<employee> — the latest screenshot (image/png), 404 if none yet.
  * Events live at system-feed/<employee>.jsonl (machine-owned namespace, capped at the last 500). */
@@ -49,7 +49,7 @@ const FEED_CAP = 500;
 // Must match the entry in wrangler.toml — the scheduled handler receives the expression verbatim.
 const RUNNER_CRON = '*/3 * * * *';
 
-/* The default team. Replace these with your own — the bio doubles as the member's job
+/* The default team. Replace these with your own — the bio doubles as the staffer's job
  * description, so it is worth writing as if the agent will read it (it can). */
 const DEFAULT_STAFF = [
   { screen_name: 'Ada', emoji: '📊', bio: 'ops lead — plans the work, splits it up, reports back' },
@@ -149,7 +149,7 @@ async function runTool(env, name, args) {
   }
 }
 
-/* Append a message to a staff member's thread, applying CLAIM VERIFICATION.
+/* Append a message to a staffer's thread, applying CLAIM VERIFICATION.
  *
  * Language models — especially cheap ones — report "done" when the artifact never landed, and a
  * chat transcript full of confident completions is worth nothing on its own. So the platform
@@ -332,7 +332,7 @@ export default {
       return new Response(JSON.stringify({ ok: true, employee: emp, events: lines.slice(-limit).reverse().map((l) => JSON.parse(l)) }), { headers: JSONH });
     }
 
-    // ── CHAT: private team comms, one thread per staff member, stored in this worker's own R2
+    // ── CHAT: private team comms, one thread per staffer, stored in this worker's own R2
     // at threads/<name>.jsonl. A responder drains its thread and appends replies the same way.
     if (u.pathname === '/chat/roster' && req.method === 'GET') {
       const feeds = await env.FS.list({ prefix: 'system-feed/', limit: 200 });

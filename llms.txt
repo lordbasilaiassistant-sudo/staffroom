@@ -1,13 +1,12 @@
 # Staffroom
 
-> Open-source AI staff: persistent AI teammates with their own always-on computer, watchable
-> screens, private team chat, and claim verification built into the chat. Bring your own model,
-> including free ones. Self-hosts as a single Cloudflare Worker.
+> Open-source AI staff: a team of persistent AI staffers with their own always-on computer,
+> watchable screens, private team chat, and claim verification built into the chat. Bring your own
+> model, including free ones. Self-hosts as a single Cloudflare Worker.
 
 One Worker, one R2 bucket, no other dependencies. It ships a runner that makes the staff answer
 their own threads on a cron, and works equally well with the runner off and your own agent harness
-driving the threads over HTTP. License: MIT. Status: pre-1.0, breaking changes expected. The name
-is a placeholder.
+driving the threads over HTTP. License: MIT. Status: pre-1.0, breaking changes expected.
 
 ## What it provides
 
@@ -16,8 +15,8 @@ is a placeholder.
   (`GET|PUT|DELETE /fs/<path>`, `GET /ls/<prefix>`). Survives every laptop going to sleep. An
   hourly cron appends to `system/heartbeat.log` so uptime is measurable rather than claimed.
 - **Activity feeds and screens.** `POST /activity {employee, action, detail?, screenshot_b64?}`;
-  the UI renders each teammate's stream as their live screen (`GET /screen/<name>`).
-- **Private team chat.** One thread per teammate at `threads/<name>.jsonl`;
+  the UI renders each staffer's stream as their live screen (`GET /screen/<name>`).
+- **Private team chat.** One thread per staffer at `threads/<name>.jsonl`;
   `GET /chat/thread/<name>`, `POST /chat/send {to, body}`.
 - **Claim verification.** When an agent's message sounds like completion, the server finds the last
   work order in that thread naming `shared/` paths and checks whether each path actually changed
@@ -26,7 +25,7 @@ is a placeholder.
   visible "unverified" informs the reader. Sender kind comes from the credential, not the payload:
   humans hold session tokens, agents hold the machine key.
 - **The staff runner.** A 3-minute cron replies on any thread whose newest message isn't from its
-  own staff member: the member gets its bio as persona, the last 12 messages, and tools onto the
+  own staffer: that staffer gets its bio as persona, the last 12 messages, and tools onto the
   filesystem (`fs_read`, `fs_list`, `fs_write`, `log_activity`). Replies go through the same append
   path as everyone's, so the runner's own claims are verified too. `POST /runner/tick` (machine key)
   runs one round immediately. Bounds: 6 tool rounds per reply, 2 staff per tick, 1200 output tokens,
@@ -34,7 +33,7 @@ is a placeholder.
   (`x-api-key` + `anthropic-version`, tools with `input_schema`), so `BRAIN_URL` can point at
   Anthropic or any Anthropic-compatible endpoint, free tiers included. Unset `BRAIN_API_KEY` and the
   staff simply never reply; nothing else changes.
-- **Two UIs.** `/app` — three panes: staff, chat, that teammate's computer. `/office` — a read-only
+- **Two UIs.** `/app` — three panes: staff, chat, that staffer's computer. `/office` — a read-only
   wall view. `/app?demo=1` runs a seeded demo with no account and no keys.
 
 ## Auth
@@ -46,7 +45,7 @@ the UI shells, whose data calls are all gated.
 
 ## Path conventions
 
-`<name>/…` a teammate's private work · `shared/…` handoffs, and the namespace claim verification
+`<name>/…` a staffer's private work · `shared/…` handoffs, and the namespace claim verification
 watches · `system/…` machine-owned, writes refused · `system-feed/`, `threads/`, `screens/`
 machine-managed.
 
@@ -60,12 +59,12 @@ screenshot, 30-day sessions.
 `COMPUTER_TOKEN` (secret, the machine key) · `BRAIN_API_KEY` (secret, optional — the staff's model
 key) · `BRAIN_URL` and `BRAIN_MODEL` (vars) · `OWNER_NAME` (var) · `FS` (R2 binding). Edit
 `DEFAULT_STAFF` in `src/index.mjs` to name your own team; the bios are shown in the UI and used as
-each member's persona, so they are worth writing as job descriptions.
+each staffer's persona, so they are worth writing as job descriptions.
 
 ## Not included
 
-One model endpoint for the whole staff rather than per-teammate models. No rate limiting. No
-per-teammate access control — any valid token reads any thread. The `plan` field on a user is a
+One model endpoint for the whole staff rather than per-staffer models. No rate limiting. No
+per-staffer access control — any valid token reads any thread. The `plan` field on a user is a
 label with no enforcement behind it. No test suite yet.
 
 ## Source
