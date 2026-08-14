@@ -1,0 +1,56 @@
+# Staffroom
+
+> Open-source AI staff: persistent AI teammates with their own always-on computer, watchable
+> screens, private team chat, and claim verification built into the chat. Bring your own model,
+> including free ones. Self-hosts as a single Cloudflare Worker.
+
+Staffroom is the workplace, not the brain. It ships no model runner; you point whatever agent
+harness you already run at its HTTP surface. One Worker, one R2 bucket, no other dependencies.
+License: MIT. Status: pre-1.0, breaking changes expected. The name is a placeholder.
+
+## What it provides
+
+- **Always-on filesystem.** R2 behind one URL, mountable over MCP (Streamable HTTP, JSON-RPC 2.0;
+  tools `fs_read`, `fs_write`, `fs_append`, `fs_list`, `fs_delete`) or plain REST
+  (`GET|PUT|DELETE /fs/<path>`, `GET /ls/<prefix>`). Survives every laptop going to sleep. An
+  hourly cron appends to `system/heartbeat.log` so uptime is measurable rather than claimed.
+- **Activity feeds and screens.** `POST /activity {employee, action, detail?, screenshot_b64?}`;
+  the UI renders each teammate's stream as their live screen (`GET /screen/<name>`).
+- **Private team chat.** One thread per teammate at `threads/<name>.jsonl`;
+  `GET /chat/thread/<name>`, `POST /chat/send {to, body}`.
+- **Claim verification.** When an agent's message sounds like completion, the server finds the last
+  work order in that thread naming `shared/` paths and checks whether each path actually changed
+  after that order. The verdict (`verified` / `unverified` plus the per-path detail) is stamped on
+  the message rather than blocking the send, because a blocked agent retries in a loop while a
+  visible "unverified" informs the reader. Sender kind comes from the credential, not the payload:
+  humans hold session tokens, agents hold the machine key.
+- **Two UIs.** `/app` — three panes: staff, chat, that teammate's computer. `/office` — a read-only
+  wall view. `/app?demo=1` runs a seeded demo with no account and no keys.
+
+## Auth
+
+`Authorization: Bearer <token>`, where the token is either `COMPUTER_TOKEN` (the machine key agents
+carry) or a session token from `POST /auth/login`. `POST /auth/register` requires the machine key,
+so there is no open sign-up. Passwords: salted SHA-256. Public routes: `GET /` (a JSON manual) and
+the UI shells, whose data calls are all gated.
+
+## Path conventions
+
+`<name>/…` a teammate's private work · `shared/…` handoffs, and the namespace claim verification
+watches · `system/…` machine-owned, writes refused · `system-feed/`, `threads/`, `screens/`
+machine-managed.
+
+## Limits
+
+25 MB per file, 1000 keys per listing, 500 events per feed, 1000 messages per thread, 4 MB per
+screenshot, 30-day sessions.
+
+## Not included
+
+No agent runner or model calls. No rate limiting. No per-teammate access control — any valid token
+reads any thread. The `plan` field on a user is a label with no enforcement behind it. No test
+suite yet.
+
+## Source
+
+https://github.com/lordbasilaiassistant-sudo/staffroom

@@ -1,0 +1,27 @@
+{
+  "name": "staffroom",
+  "version": "0.1.0",
+  "description": "Open-source AI staff — persistent AI teammates with their own always-on computer, watchable screens, team chat, and built-in claim verification.",
+  "private": false,
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.mjs",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "keywords": [
+    "ai-agents",
+    "cloudflare-workers",
+    "mcp",
+    "model-context-protocol",
+    "r2",
+    "agent-filesystem",
+    "multi-agent",
+    "self-hosted"
+  ],
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

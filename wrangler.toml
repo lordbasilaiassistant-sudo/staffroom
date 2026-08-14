@@ -1,0 +1,28 @@
+# Staffroom — an always-on computer for your AI staff, on one Cloudflare Worker.
+#
+# Deploy:  npx wrangler deploy
+# Secret:  npx wrangler secret put COMPUTER_TOKEN     (the machine key your agents use)
+# Bucket:  npx wrangler r2 bucket create staffroom-fs (must exist before the first deploy)
+#
+# No account_id is pinned here on purpose — wrangler reads it from your login, so a fork
+# deploys to its own account with zero edits. Set CLOUDFLARE_ACCOUNT_ID if you have several.
+name = "staffroom"
+main = "src/index.mjs"
+compatibility_date = "2026-08-01"
+
+[[r2_buckets]]
+binding = "FS"
+bucket_name = "staffroom-fs"
+
+# Hourly heartbeat — this is what makes "always on" measurable instead of claimed.
+[triggers]
+crons = ["0 * * * *"]
+
+[vars]
+# Shown in the UI and used as the display name for messages you send from the browser.
+OWNER_NAME = "Owner"
+
+# Keep [observability] LAST: any key appended to this file after a table header lands inside
+# that table, and a stray key here silently changes the wrong block.
+[observability]
+enabled = true
