@@ -127,6 +127,9 @@ async function apiCall(env, tp, cName, method, path, body) {
   if (!c) return `ERROR: no connected service named "${cName}"${custom.length ? ' - available: ' + custom.map((x) => x.name).join(', ') : ' - the boss has not connected any services yet'}`;
   const m = String(method || 'GET').toUpperCase();
   if (!['GET', 'POST', 'PUT', 'DELETE'].includes(m)) return 'ERROR: method must be GET/POST/PUT/DELETE';
+  // read-only connectors (2026-08-15 overnight-safety audit): a marketplace token that can EDIT
+  // listings must not be steerable by a confused free brain - the venue is revenue-bearing.
+  if (c.readonly && m !== 'GET') return `ERROR: the ${c.name} connection is READ-ONLY for staff - writes to it happen through the boss's own tools, never from the office`;
   const url = c.base.replace(/\/$/, '') + (String(path).startsWith('/') ? path : '/' + path);
   if (!url.startsWith(c.base.replace(/\/$/, ''))) return 'ERROR: path escapes the service base';
   try {
