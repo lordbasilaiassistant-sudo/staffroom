@@ -447,10 +447,25 @@ async function ytRecentComments(env, tp, limit) {
     return `[${t.snippet?.topLevelComment?.id}] ${c.authorDisplayName} on video ${c.videoId} (${(c.publishedAt || '').slice(0, 16)}): ${String(c.textDisplay || '').slice(0, 200)} (${t.snippet?.totalReplyCount || 0} replies)`;
   }).join('\n');
 }
+/* BRAND GATE on public replies (2026-08-15, Anthony: "make sure they don't make us look bad").
+ * yt_reply is the office's ONE stranger-facing surface; by the two-gates law a free-brain draft
+ * must pass a STRONGER model's judgment before it ships. Fail-closed: judge unreachable = held. */
+async function ytReplyGate(env, text) {
+  const sys = `You are the brand-safety gate for comment replies posted publicly AS a small YouTube channel (public-domain history films, warm indie voice). Judge ONLY the reply text. HOLD if any: rude/mocking/political flame-bait; spammy or self-promotional; link begging; invented specific facts (dates, names, claims a channel couldn't verify from the video alone); creepy/overfamiliar; AI-slop phrasing ("delve", "tapestry", excessive enthusiasm); over 2 sentences of filler. PASS if: short, warm, human, on-topic, could be read aloud by the channel owner without wincing. Reply STRICT JSON only: {"post":true|false,"reason":"<=60 chars"}`;
+  try {
+    const res = await callBrain(env, sys, [{ role: 'user', content: `REPLY TO JUDGE:\n${String(text).slice(0, 900)}` }], { ...STRONG_FALLBACK }, { tools: false, maxTokens: 400 });
+    const out = (res.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('');
+    const j = JSON.parse((out.match(/\{[\s\S]*\}/) || ['{}'])[0]);
+    if (typeof j.post !== 'boolean') return { post: false, reason: 'gate returned no verdict - held' };
+    return { post: j.post, reason: String(j.reason || '').slice(0, 80) };
+  } catch (e) { return { post: false, reason: 'gate unreachable - held (fail-closed)' }; }
+}
 async function ytReply(env, tp, parentId, text) {
   const at = await googleToken(env, tp);
   if (!at) return 'Google is not connected';
   if (!parentId || !text) return 'ERROR: need parent_id and text';
+  const gate = await ytReplyGate(env, text);
+  if (!gate.post) return `GATE HELD your reply (${gate.reason}). It was NOT posted. Rephrase to be shorter, warmer and claim-free, or skip this comment.`;
   const r = await fetch('https://www.googleapis.com/youtube/v3/comments?part=snippet', {
     method: 'POST',
     headers: { authorization: `Bearer ${at}`, 'content-type': 'application/json' },
