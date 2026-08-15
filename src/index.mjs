@@ -793,7 +793,7 @@ export default {
           return new Response(obj.body, { headers: { 'content-type': 'text/plain; charset=utf-8' } });
         }
         if (req.method === 'PUT') {
-          guardWrite(p);
+          if (!sess.machine) guardWrite(p); // /fs is root-only; the machine key may service system/ (staffer tools still can't)
           const body = await req.text();
           if (body.length > MAX_BYTES) return new Response(JSON.stringify({ ok: false, error: '25 MB cap' }), { status: 413, headers: JSONH });
           await env.FS.put(p, body);

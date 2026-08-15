@@ -201,7 +201,10 @@ async function repoRead(env, tp, path) {
   const { custom = [] } = await getConnectors(env, tp);
   const c = custom.find((x) => x.name.toLowerCase() === 'github');
   if (!c) return 'ERROR: no github service connected';
-  const p = String(path || '').replace(/^\/+/, '');
+  const p0 = String(path || '').replace(/^\/+/, '');
+  // path courtesy (2026-08-14): staffers passed "IDEAS_BACKLOG.md" bare, got a guard error, and
+  // reported the file "missing" — auto-prefix instead of failing a read that was always in scope
+  const p = p0.startsWith('company/') ? p0 : 'company/' + p0;
   if (!/^company\/[A-Za-z0-9_\/.-]+$/.test(p) || p.includes('..')) return 'ERROR: repo_read only reads company/... paths';
   try {
     const r = await fetch(`https://api.github.com/repos/lordbasilaiassistant-sudo/broketobuilt/contents/${p}`, {
@@ -314,6 +317,14 @@ Rules:
   several message_teammate calls, ALL IN THE SAME ROUND. Include a concrete shared/ file path in
   each order so the work is verifiable. Then reply saying who got what and why. Do not do a task
   yourself if you are delegating it.
+- PERMISSIONS ARE SIMPLE: every tool in your list is ALREADY authorized - connected services
+  included, no extra consent step exists. There are NO department file permissions, NO upload
+  permissions: every staffer reads and writes ALL of shared/. If you catch yourself typing
+  "I don't have permission/access" - stop, you are hallucinating a barrier; RUN the tool and
+  report its actual output or its actual error instead.
+- Never say a tool "does not exist" from memory - your live tool list is in front of you every
+  round. If a tool you expected is genuinely absent this round, say which task needs it and finish
+  the rest; if a tool errors, quote the error verbatim.
 - Task outside your charge? NEVER "I can't do that." The only acceptable answer is "I know who
   can" - list_team, pick the best fit, message_teammate them the job, and tell the sender who has
   it and why. Every task finds its owner; nothing bounces back unowned.
@@ -393,7 +404,15 @@ async function ytRecentComments(env, tp, limit) {
   const d = await (await fetch(`https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&allThreadsRelatedToChannelId=${chId}&order=time&maxResults=${Math.min(limit || 15, 30)}&textFormat=plainText`, { headers: h, signal: AbortSignal.timeout(20000) })).json();
   if (!Array.isArray(d.items)) return `ERROR: ${String(d.error?.message || 'comment list failed').slice(0, 150)}`;
   if (!d.items.length) return 'no comments yet';
-  return d.items.map((t) => {
+  // replied-ledger (2026-08-14, Tuber re-reply scar): the model cannot tell OUR reply from anyone
+  // else's in totalReplyCount, so an every-3h routine happily answers the same comment forever.
+  // Answered threads are filtered OUT here — what the model can't see it can't re-reply to.
+  const seenO = await env.FS.get(`${tp}system/yt-replied.json`);
+  const seen = new Set(seenO ? JSON.parse(await seenO.text()) : []);
+  const fresh = d.items.filter((t) => !seen.has(t.snippet?.topLevelComment?.id));
+  const skipped = d.items.length - fresh.length;
+  if (!fresh.length) return `no new comments - all ${skipped} recent threads already answered by us earlier`;
+  return (skipped ? `(${skipped} older threads hidden - already answered by us)\n` : '') + fresh.map((t) => {
     const c = t.snippet?.topLevelComment?.snippet || {};
     return `[${t.snippet?.topLevelComment?.id}] ${c.authorDisplayName} on video ${c.videoId} (${(c.publishedAt || '').slice(0, 16)}): ${String(c.textDisplay || '').slice(0, 200)} (${t.snippet?.totalReplyCount || 0} replies)`;
   }).join('\n');
@@ -409,6 +428,13 @@ async function ytReply(env, tp, parentId, text) {
     signal: AbortSignal.timeout(20000),
   });
   const d = await r.json().catch(() => ({}));
+  if (r.ok) {
+    // record the answered thread so ytRecentComments never shows it again (re-reply scar)
+    const k = `${tp}system/yt-replied.json`;
+    const o = await env.FS.get(k);
+    const seen = o ? JSON.parse(await o.text()) : [];
+    if (!seen.includes(parentId)) { seen.push(parentId); await env.FS.put(k, JSON.stringify(seen.slice(-500))); }
+  }
   return r.ok ? `replied to ${parentId}` : `ERROR: ${String(d.error?.message || 'reply failed').slice(0, 150)}`;
 }
 
