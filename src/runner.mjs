@@ -221,7 +221,9 @@ async function repoRead(env, tp, path) {
  * Each turn only carries the core tools + the ones the incoming text makes relevant. */
 function pickTools(text) {
   const t = String(text || '').toLowerCase();
-  const names = new Set(['fs_read', 'fs_list', 'fs_write', 'log_activity', 'list_team', 'message_teammate', 'ask_user', 'coworker_report']);
+  // api_call + http_request live in the baseline (bench scar: an Auditor bounce carries no
+  // 'api' keyword, so the retry round arrived tool-starved and could only apologize)
+  const names = new Set(['fs_read', 'fs_list', 'fs_write', 'log_activity', 'list_team', 'message_teammate', 'ask_user', 'coworker_report', 'api_call', 'http_request']);
   const add = (...xs) => xs.forEach((x) => names.add(x));
   if (/mail|inbox|email/.test(t)) add('gmail_unread');
   if (/calendar|schedule|meeting|appointment|this week|today|tomorrow/.test(t)) add('calendar_read');
@@ -274,7 +276,7 @@ function fromOpenAI(d) {
 }
 
 function systemPrompt(staffer, officeCtx) {
-  const deptLine = staffer.dept || staffer.spec ? `Department: ${staffer.dept || 'none'}. Your ONE specialization: ${staffer.spec || staffer.bio}. STAY NARROW - you do your specialization and nothing else; every other task gets routed to the teammate whose dept/specialization fits (list_team shows who's who).\n` : '';
+  const deptLine = staffer.dept || staffer.spec ? `Department: ${staffer.dept || 'none'}. Your ONE specialization: ${staffer.spec || staffer.bio}. STAY NARROW - you do your specialization and nothing else; every other task gets routed to the teammate whose dept/specialization fits (list_team shows who's who). Having a tool that COULD try a task does not make it yours: before acting, ask "is this MY specialization?" - if not, message_teammate the right desk immediately instead of guessing at it yourself (bench scar: a YouTube staffer burned 4 API calls on a finance question that Finance answers in one).\n` : '';
   return `You are ${staffer.screen_name}, an AI staffer at a company. Your charge: ${staffer.bio}.
 ${deptLine}You are talking with your team in a private chat. The newest message is addressed to you.
 ${officeCtx || ''}
@@ -622,6 +624,11 @@ report of being BLOCKED or failing, with the ledger showing real attempts, is ok
 point); only stamp false when a claim of SUCCESS lacks evidence. A reply presenting SPECIFIC DATA
 (mail counts, senders, calendar events, balances, numbers) while the ledger is EMPTY is fabricated
 - stamp it false.
+Second check, ROUTING (the office law is narrow specialization): if the reply ATTEMPTS or ANSWERS
+work clearly outside the staffer's stated specialization instead of routing it to the right desk
+via message_teammate, or if it asks THE BOSS to go do the legwork (check a dashboard, look
+something up) when a TEAMMATE owns that lane, stamp it false with reason "route it: <task> belongs
+to <dept> - message_teammate them". Honest in-lane blockers stay ok.
 Reply with STRICT JSON only, nothing else: {"ok":true|false,"reason":"<=80 chars"}`;
 export async function auditTick(env, tp = '', deps) {
   const threads = await env.FS.list({ prefix: `${tp}threads/`, limit: 30 });
@@ -647,7 +654,10 @@ export async function auditTick(env, tp = '', deps) {
         const f = await env.FS.get(tp + p);
         evidence += `\n--- ${p} ${f ? '(exists)' : '(DOES NOT EXIST)'} ---\n${f ? (await f.text()).slice(0, 600) : ''}`;
       }
-      const prompt = `WORK ORDER (${order?.from || 'none'}): ${(order?.body || '(no prior order)').slice(0, 800)}\n\nSTAFFER REPLY (${m.from}): ${m.body.slice(0, 800)}\n\nLEDGER (tools actually run): ${m.actions.join(', ') || 'none'}\n\nFILE EVIDENCE:${evidence || ' (no files named)'}`;
+      // routing check needs to know who does what (bench scar: out-of-lane grabs + boss-punts)
+      const me = deps?.staff?.find((s) => s.screen_name.toLowerCase() === owner);
+      const rosterLine = (deps?.staff || []).map((s) => `${s.screen_name} (${s.dept || '-'}: ${String(s.spec || s.bio || '').slice(0, 45)})`).join(' · ');
+      const prompt = `THIS STAFFER'S SPECIALIZATION: ${me ? `${me.dept || '-'} - ${me.spec || me.bio}` : 'unknown'}\nTHE TEAM: ${rosterLine || 'unknown'}\n\nWORK ORDER (${order?.from || 'none'}): ${(order?.body || '(no prior order)').slice(0, 800)}\n\nSTAFFER REPLY (${m.from}): ${m.body.slice(0, 800)}\n\nLEDGER (tools actually run): ${m.actions.join(', ') || 'none'}\n\nFILE EVIDENCE:${evidence || ' (no files named)'}`;
       try {
         const res = await callBrain(env, AUDIT_SYS, [{ role: 'user', content: prompt }], null, { tools: false, maxTokens: 150 });
         const text = (res.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('');

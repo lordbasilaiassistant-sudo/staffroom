@@ -180,7 +180,7 @@ async function appendToThread(env, who, from, body, tp = '', options, actions, r
     }
   }
   const claimsDone = from !== 'Anthony' && !msg.verify
-    && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back|committed|successful(ly)?|landed|pushed|published|replied to)\b/i.test(msg.body);
+    && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back|committed|successful(ly)?|landed|pushed|published|replied to|(messaging|forwarding|routing|delegating|handing|sending)( \w+){0,3} (now|next|about)|(messaging|forwarding|routing|delegating) (him|her|them|[A-Z]\w+))\b/i.test(msg.body);
   // a green stamp must be earned by the AUTHOR: files changed by a teammate must never verify
   // someone else's claim (Gigsby false-green scar, 2026-08-14 - "bad for business")
   const effectful = /^(fs_write|fs_append|fs_delete|api_call|http_request|repo_commit|yt_reply|wallet_create|wallet_import|message_teammate|notify_boss|hire_staffer|set_routine|login_desk|collect_login|browser_visit)/;
@@ -820,8 +820,13 @@ export default {
   async scheduled(event, env) {
     // */3 cron = the staff answer their threads (free-model brains, proof-stamped).
     if (event.cron === '*/3 * * * *') {
-      try { await runTick(env, scopedDeps('', await getStaff(env, ''))); } catch {}
-      try { await auditTick(env, '', scopedDeps('', await getStaff(env, ''))); } catch {} // Auditor sweeps + bounces suspects back for retry
+      // NEVER a bare catch here (2026-08-15 scar: the whole staff went quiet and the silent
+      // catch made the outage invisible) — failures go to observability logs, loudly.
+      try {
+        const out = await runTick(env, scopedDeps('', await getStaff(env, '')));
+        for (const r of out || []) if (r?.error) console.error(`runTick ${r.staffer}: ${r.error}`);
+      } catch (e) { console.error('runTick tick died: ' + String(e?.stack || e).slice(0, 500)); }
+      try { await auditTick(env, '', scopedDeps('', await getStaff(env, ''))); } catch (e) { console.error('auditTick died: ' + String(e?.stack || e).slice(0, 500)); }
       return;
     }
     // hourly cron = the PC-off proof: one line per hour, written by the edge, no PC involved.
