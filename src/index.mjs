@@ -389,7 +389,7 @@ export default {
       if (!recentWake) {
         const roster = await getStaff(env, h.tp);
         const staffer = roster.find((s) => s.screen_name.toLowerCase() === h.staffer.toLowerCase());
-        if (staffer) ctx.waitUntil(respondForStaffer(env, scopedDeps(h.tp, roster), staffer).catch(() => {}));
+        if (staffer) ctx.waitUntil(respondForStaffer(env, scopedDeps(h.tp, roster), staffer).catch((e) => console.error('hook wake failed ' + staffer.screen_name + ': ' + String(e?.stack || e).slice(0, 400))));
       }
       return new Response(JSON.stringify({ ok: true }), { headers: JSONH });
     }
@@ -766,7 +766,7 @@ export default {
       if (sess.root ? from === 'Anthony' : true) {
         const roster = await getStaff(env, tp);
         const staffer = roster.find((s) => s.screen_name.toLowerCase() === who);
-        if (staffer) ctx.waitUntil(respondForStaffer(env, scopedDeps(tp, roster), staffer).catch(() => {}));
+        if (staffer) ctx.waitUntil(respondForStaffer(env, scopedDeps(tp, roster), staffer).catch((e) => console.error('send wake failed ' + staffer.screen_name + ': ' + String(e?.stack || e).slice(0, 400))));
       }
       return new Response(JSON.stringify({ ok: true, verify }), { headers: JSONH });
     }
@@ -858,7 +858,7 @@ export default {
               const st = staff.find((s) => s.screen_name.toLowerCase() === String(r.staffer).toLowerCase());
               if (st) {
                 await appendToThread(env, st.screen_name.toLowerCase(), r.from || 'Anthony', `[Routine] ${r.text}`, tp2);
-                await respondForStaffer(env, scopedDeps(tp2, staff), st).catch(() => {});
+                await respondForStaffer(env, scopedDeps(tp2, staff), st).catch((e) => console.error('routine wake failed ' + st.screen_name + ': ' + String(e?.stack || e).slice(0, 400)));
               }
             }
           }

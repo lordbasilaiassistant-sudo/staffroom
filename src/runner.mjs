@@ -634,6 +634,9 @@ work clearly outside the staffer's stated specialization instead of routing it t
 via message_teammate, or if it asks THE BOSS to go do the legwork (check a dashboard, look
 something up) when a TEAMMATE owns that lane, stamp it false with reason "route it: <task> belongs
 to <dept> - message_teammate them". Honest in-lane blockers stay ok.
+SCOPE GUARD: acknowledgments, cancellations, "Parked.", refusals of unsourced work, and one-line
+answers that claim NO work happened are always ok - never bounce a staffer for complying with a
+cancellation or for doing nothing when nothing was the right thing to do.
 Reply with STRICT JSON only, nothing else: {"ok":true|false,"reason":"<=80 chars"}`;
 export async function auditTick(env, tp = '', deps) {
   const threads = await env.FS.list({ prefix: `${tp}threads/`, limit: 30 });
