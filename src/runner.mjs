@@ -321,6 +321,11 @@ Rules:
   several message_teammate calls, ALL IN THE SAME ROUND. Include a concrete shared/ file path in
   each order so the work is verifiable. Then reply saying who got what and why. Do not do a task
   yourself if you are delegating it.
+- WORK ORIGINATES FROM THREE SOURCES ONLY: the boss (Anthony), your standing routine, or a
+  Webhook event. You may decompose and delegate a task you were GIVEN; you may NEVER originate
+  a new project, "improvement", or investigation on your own initiative - an office that invents
+  its own work burns real money on phantoms. If you cannot trace the task in front of you to one
+  of those three sources in this thread, say "unsourced task - parking it" and stop.
 - PERMISSIONS ARE SIMPLE: every tool in your list is ALREADY authorized - connected services
   included, no extra consent step exists. There are NO department file permissions, NO upload
   permissions: every staffer reads and writes ALL of shared/. If you catch yourself typing
@@ -677,8 +682,20 @@ export async function auditTick(env, tp = '', deps) {
       if (src?.audit && !fm.audit) { fm.audit = src.audit; changed = true; }
     }
     if (changed) await env.FS.put(t.key, freshMsgs.map((x) => JSON.stringify(x)).join('\n') + '\n');
-    // suspect stamp on the thread's LIVE tail = a work order: bounce it back for one retry
+    // suspect stamp on the thread's LIVE tail = a work order: bounce it back for one retry.
+    // BOUNCE CAP (2026-08-15 churn scar): an office-Eli-invented phantom project ping-ponged
+    // through bounces for hours - each weak retry earned a fresh stamp and a fresh bounce.
+    // Max 2 Auditor bounces without an intervening human message; then park it, once, quietly.
     const tail = freshMsgs[freshMsgs.length - 1];
+    const sinceHuman = [];
+    for (let k = freshMsgs.length - 1; k >= 0; k--) { if (freshMsgs[k].from === 'Anthony') break; sinceHuman.push(freshMsgs[k]); }
+    const recentBounces = sinceHuman.filter((x) => x.from === 'Auditor').length;
+    if (deps && changed && tail?.audit?.v === 'suspect' && recentBounces >= 2) {
+      if (!sinceHuman.some((x) => x.from === 'Auditor' && /PARKED/.test(x.body))) {
+        await deps.appendToThread(env, t.key.slice(`${tp}threads/`.length).replace(/\.jsonl$/, ''), 'Auditor', 'PARKED: two audit bounces did not produce verified work. This task is parked for the boss - no further attempts, no more replies about it. Take your next real order.');
+      }
+      continue;
+    }
     if (deps && changed && tail?.audit?.v === 'suspect' && !tail.audit.retried) {
       tail.audit.retried = true;
       await env.FS.put(t.key, freshMsgs.map((x) => JSON.stringify(x)).join('\n') + '\n');
