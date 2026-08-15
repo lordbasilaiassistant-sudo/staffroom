@@ -174,7 +174,7 @@ async function appendToThread(env, who, from, body, tp = '', options, actions, r
       msg.verify = { verdict: 'unverified', reason: 'claims a login desk, but never opened one' };
     } else if (/\b(wrote|committed|saved|created) .{0,40}shared\//i.test(msg.body) && !did('fs_write') && !did('fs_append')) {
       msg.verify = { verdict: 'unverified', reason: 'claims a file write, but wrote nothing' };
-    } else if (actions.length === 0 && /\b(web_fetch|web_search|repo_commit|repo_read|api_call|fs_write|fs_append|gmail_unread|calendar_read|yt_recent_comments|yt_reply|wallet_list|wallet_create|wallet_import|browser_visit|login_desk|collect_login|message_teammate|notify_boss|set_routine|hire_staffer)\b/i.test(msg.body)) {
+    } else if (actions.length === 0 && /\b(web_fetch|web_search|repo_commit|repo_read|api_call|http_request|fs_write|fs_append|gmail_unread|calendar_read|yt_recent_comments|yt_reply|wallet_list|wallet_create|wallet_import|browser_visit|login_desk|collect_login|message_teammate|notify_boss|set_routine|hire_staffer)\b/i.test(msg.body)) {
       // names a tool while the ledger is empty = describing tool output it never produced
       msg.verify = { verdict: 'unverified', reason: 'names tools it never ran - the ledger is empty' };
     }
@@ -183,7 +183,7 @@ async function appendToThread(env, who, from, body, tp = '', options, actions, r
     && /\b(done|fixed|fix is in|passes|passing|complete[d]?|shipped|deployed|green|wrote back|written back|committed|successful(ly)?|landed|pushed|published|replied to)\b/i.test(msg.body);
   // a green stamp must be earned by the AUTHOR: files changed by a teammate must never verify
   // someone else's claim (Gigsby false-green scar, 2026-08-14 - "bad for business")
-  const effectful = /^(fs_write|fs_append|fs_delete|api_call|repo_commit|yt_reply|wallet_create|wallet_import|message_teammate|notify_boss|hire_staffer|set_routine|login_desk|collect_login|browser_visit)/;
+  const effectful = /^(fs_write|fs_append|fs_delete|api_call|http_request|repo_commit|yt_reply|wallet_create|wallet_import|message_teammate|notify_boss|hire_staffer|set_routine|login_desk|collect_login|browser_visit)/;
   const authorActed = !Array.isArray(actions) || actions.some((a) => effectful.test(a));
   // "ran no tools" must mean literally that - a populated ledger with only reads is engagement, not fabrication
   const ranAnything = !Array.isArray(actions) || actions.length > 0;

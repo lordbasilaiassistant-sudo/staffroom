@@ -24,6 +24,7 @@ const RUNNER_TOOLS = [
   { name: 'web_search', description: 'Search the live web. Returns top results with titles, URLs and snippets. Use for research, competitor reads, fact checks.', input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] } },
   { name: 'web_fetch', description: 'Quick read of a URL (no JS, HTML stripped, capped). Cheapest way to read a plain page; download by fetching then fs_write.', input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
   { name: 'browser_visit', description: 'Open a page in YOUR own Chrome (a real browser - runs JS, carries YOUR saved logins). You get the page back as clean markdown, and a screenshot lands on your monitor so the boss can watch. web_fetch is cheaper for plain public text.', input_schema: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } },
+  { name: 'http_request', description: 'Direct HTTP call to ANY url - GET/POST/PUT/DELETE, optional JSON body and extra headers. For public APIs that have no connector (connected services still go through api_call, which carries their auth). Raw response text comes back, capped. Never put secrets in the url, body or headers.', input_schema: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string', description: 'GET (default), POST, PUT or DELETE' }, body: { type: 'string', description: 'request body, usually JSON' }, headers: { type: 'object', description: 'extra headers, e.g. {"content-type":"application/json"}' } }, required: ['url'] } },
   { name: 'login_desk', description: "Open YOUR browser for the boss to sign into a service by hand (their login stays on YOUR computer only). Returns a live-control link for them. Use when a job needs an account and your jar has no login for it.", input_schema: { type: 'object', properties: { service: { type: 'string', description: 'what to sign into, e.g. youtube.com' } } } },
   { name: 'collect_login', description: 'After the boss says they signed in on your login desk, collect the cookies into your own jar. From then on browser_visit is signed in there.', input_schema: { type: 'object', properties: {} } },
   { name: 'list_team', description: 'See your teammates: names, roles, what each is best at. Use before delegating.', input_schema: { type: 'object', properties: {} } },
@@ -234,7 +235,8 @@ function pickTools(text) {
   if (/notify|ping|alert|phone/.test(t)) add('notify_boss');
   if (/routine|daily|every |cron|recurring|standing order/.test(t)) add('set_routine');
   if (/hire|new (teammate|staffer|agent|employee)/.test(t)) add('hire_staffer');
-  if (/\bapi\b|service|apify|github/.test(t)) add('api_call');
+  if (/\bapi\b|service|apify|github/.test(t)) add('api_call', 'http_request');
+  if (/\bpost\b|\bput\b|endpoint|payload|webhook|http_request|submit .{0,12}(api|json|data)/.test(t)) add('http_request');
   if (/repo_commit|repo_read|agent-reports|company repo|commit .{0,20}report|health-status|fleet-status|ideas_backlog/i.test(t)) add('repo_commit', 'repo_read');
   if (/team_stats|review|scorecard|grade|performance/i.test(t)) add('team_stats', 'repo_commit', 'coworker_report');
   if (names.size <= 9) add('web_search', 'web_fetch'); // nothing matched: research basics
@@ -347,6 +349,24 @@ async function webSearch(env, query) {
   if (!r.ok) return `ERROR: search HTTP ${r.status}`;
   const d = await r.json();
   return (d.results || []).map((x) => `${x.title}\n${x.url}\n${String(x.content || '').slice(0, 300)}`).join('\n\n') || 'no results';
+}
+/* Arbitrary-URL HTTP (2026-08-15, "anything we throw at them" bench): web_fetch is GET-only and
+ * api_call needs a connector, so a plain "POST to this public API" order was structurally
+ * impossible. No connector auth is ever attached here - secrets stay in api_call's lane. */
+async function httpRequest(url, method, body, headers) {
+  if (!/^https?:\/\//i.test(String(url || ''))) return 'ERROR: url must start with http(s)://';
+  const m = String(method || 'GET').toUpperCase();
+  if (!['GET', 'POST', 'PUT', 'DELETE'].includes(m)) return 'ERROR: method must be GET/POST/PUT/DELETE';
+  const h = { 'user-agent': 'StaffroomBot/1.0 (+https://broke2builtai.com)' };
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (/^(authorization|cookie|x-api-key)$/i.test(k)) return `ERROR: never send credentials via http_request - auth belongs to api_call connectors`;
+    h[String(k).slice(0, 60)] = String(v).slice(0, 500);
+  }
+  if (body && !h['content-type']) h['content-type'] = 'application/json';
+  try {
+    const r = await fetch(url, { method: m, headers: h, body: body ? String(body).slice(0, 16000) : undefined, signal: AbortSignal.timeout(25000), redirect: 'follow' });
+    return `HTTP ${r.status}\n${(await r.text()).slice(0, 8000)}`;
+  } catch (e) { return `ERROR: ${String(e?.message || e).slice(0, 150)}`; }
 }
 async function webFetch(url) {
   if (!/^https?:\/\//i.test(url)) return 'ERROR: url must start with http(s)://';
@@ -830,6 +850,7 @@ export async function respondForStaffer(env, deps, staffer) {
         else if (tu.name === 'wallet_import') out = await walletImport(env, tp, tu.input?.name, tu.input?.private_key);
         else if (tu.name === 'wallet_list') out = await walletListText(env, tp);
         else if (tu.name === 'api_call') out = await apiCall(env, tp, tu.input?.connector, tu.input?.method, tu.input?.path, tu.input?.body);
+        else if (tu.name === 'http_request') out = await httpRequest(tu.input?.url, tu.input?.method, tu.input?.body, tu.input?.headers);
         else if (tu.name === 'repo_commit') out = await repoCommit(env, tp, tu.input?.path, tu.input?.content, tu.input?.message);
         else if (tu.name === 'repo_read') out = await repoRead(env, tp, tu.input?.path);
         else if (tu.name === 'team_stats') out = JSON.stringify(await teamStats(env, tp));
@@ -872,7 +893,7 @@ export async function respondForStaffer(env, deps, staffer) {
         const tgt = tu.name === 'message_teammate' ? '→' + (tu.input?.to || '')
           : tu.name === 'api_call' ? ' ' + (tu.input?.connector || '')
           : /^fs_|^repo_/.test(tu.name) ? ' ' + String(tu.input?.path || tu.input?.prefix || '').slice(0, 40)
-          : tu.name === 'browser_visit' || tu.name === 'web_fetch' ? ' ' + String(tu.input?.url || '').slice(0, 40)
+          : tu.name === 'browser_visit' || tu.name === 'web_fetch' || tu.name === 'http_request' ? ' ' + String(tu.input?.url || '').slice(0, 40)
           : tu.name === 'set_routine' ? ' ' + (tu.input?.staffer || '') : '';
         actionsLog.push(`${tu.name}${tgt}`);
       }
