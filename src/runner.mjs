@@ -105,14 +105,22 @@ export async function walletRows(env, tp) {
     }
   } catch {}
   if (rows.length) {
-    try {
-      const batch = rows.map((w, i) => ({ jsonrpc: '2.0', id: i, method: 'eth_getBalance', params: [w.address, 'latest'] }));
-      const r = await fetch('https://mainnet.base.org', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch), signal: AbortSignal.timeout(15000) });
-      const res = await r.json();
-      for (const item of Array.isArray(res) ? res : []) {
-        if (rows[item.id] && item.result) rows[item.id].base_eth = (Number(BigInt(item.result)) / 1e18).toFixed(6);
-      }
-    } catch {}
+    // RPC rotation + loud failures (2026-08-23 scar: the bare catch here ate a mainnet.base.org
+    // failure and staffers reported '?' balances as if real - a silent error reads as data)
+    for (const rpc of ['https://mainnet.base.org', 'https://base.publicnode.com', 'https://base.llamarpc.com']) {
+      try {
+        const batch = rows.map((w, i) => ({ jsonrpc: '2.0', id: i, method: 'eth_getBalance', params: [w.address, 'latest'] }));
+        const r = await fetch(rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(batch), signal: AbortSignal.timeout(15000) });
+        if (!r.ok) { console.error(`walletRows ${rpc}: HTTP ${r.status}`); continue; }
+        const res = await r.json();
+        let ok = 0;
+        for (const item of Array.isArray(res) ? res : []) {
+          if (rows[item.id] && item.result !== undefined) { try { rows[item.id].base_eth = (Number(BigInt(item.result)) / 1e18).toFixed(6); ok++; } catch {} }
+        }
+        if (ok === rows.length) break;
+        console.error(`walletRows ${rpc}: only ${ok}/${rows.length} balances resolved`);
+      } catch (e) { console.error('walletRows ' + rpc + ': ' + String(e?.message || e).slice(0, 120)); }
+    }
   }
   return rows;
 }

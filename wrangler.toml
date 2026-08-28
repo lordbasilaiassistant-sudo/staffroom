@@ -5,7 +5,7 @@
 #          npx wrangler secret put BRAIN_API_KEY      (optional — gives the staff their brains)
 #          npx wrangler secret put TAVILY_API_KEY     (optional — gives the staff web_search)
 #          npx wrangler secret put CF_BR_TOKEN        (optional — gives the staff browser_visit)
-# Bucket:  npx wrangler r2 bucket create staffroom-fs (must exist before the first deploy)
+# Bucket:  npx wrangler r2 bucket create b2b-employee-fs (must exist before the first deploy)
 #
 # No account_id is pinned here on purpose — wrangler reads it from your login, so a fork
 # deploys to its own account with zero edits. Set CLOUDFLARE_ACCOUNT_ID if you have several.
@@ -15,7 +15,10 @@ compatibility_date = "2026-08-01"
 
 [[r2_buckets]]
 binding = "FS"
-bucket_name = "staffroom-fs"
+# PRODUCTION BUCKET (2026-08-23 scar): the live employee-computer worker has ALWAYS served
+# b2b-employee-fs. Deploying with any other name repoints a live office onto an empty bucket -
+# every thread/file "vanishes" while R2 itself is untouched. Do not rename without migrating.
+bucket_name = "b2b-employee-fs"
 
 # Hourly heartbeat — what makes "always on" measurable instead of claimed — plus the 3-minute
 # tick on which the staff answer their threads. The runner cron string must match RUNNER_CRON in
